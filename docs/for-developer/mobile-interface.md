@@ -28,6 +28,32 @@ read/write functions, and task stream handles.
 The mobile binding imports `pkg/drivers/all`, so the generated binding registers
 the same bundled driver set as the CLI.
 
+## Quark Web Login
+
+Login does not require an open core. Call `StartWebLoginJSON("quark", deadlineMS)`
+on a background thread. Its data contains `login_id`, `url`, and `expires_at`;
+render `url` as a QR code for the user to scan with the Quark app.
+
+Call `PollWebLoginJSON(loginID, deadlineMS)` every two seconds. Its data contains
+`state`: `waiting`, `expired`, or `confirmed`. Only `confirmed` includes
+`params.cookie`. The flow exchanges the service ticket, bootstraps the web
+session, and validates access through the PC drive API before returning it.
+Network errors can be retried while the challenge remains valid. Refresh an
+expired challenge by starting a new login.
+
+`CloseWebLoginJSON(loginID)` cancels in-flight polling and releases the attempt.
+Sessions also expire automatically after five minutes and are consumed after
+confirmation. These handles are independent of core handles; close them when
+leaving the login UI. Never persist login IDs, QR URLs, or service tickets.
+
+The returned Cookie is a secret. Keep it in platform-protected storage and do
+not log the JSON envelope. To use it in a qrypt config, pass `params` to
+`UpdateConfigJSON` for an explicit mount add/update and call `ReloadConfigJSON`
+for an already open core; for first use, include it when importing the config.
+No config is changed automatically. When reconnecting an existing source, the
+host should validate its original directories and files before replacing its
+credential binding, as Cruise-Tune does.
+
 ## Call Semantics
 
 Mobile APIs are split by caller intent:
@@ -826,6 +852,14 @@ StopDebugServerJSON(coreID)
 LogFilesJSON(coreID)
 ReadLogJSON(coreID, name, offset, length)
 ```
+
+TCP debug listeners, including `StartDebugServerJSON`, use `debug.token` from
+the configuration loaded when the core was opened. Set a random token of at
+least 32 characters before opening the core; a missing or invalid token prevents
+TCP startup. After `adb forward`, connect with the CLI's `--token-file PATH`
+or send `Authorization: Bearer <token>` from a native HTTP client. Keep this
+token private. Non-loopback Host and browser Origin headers are rejected.
+Unix sockets continue to use filesystem permissions without a token.
 
 `DebugSnapshotJSON` includes a `mobile_handles` object reporting the number of
 open file, virtual file, download, upload stream, and task event handles for

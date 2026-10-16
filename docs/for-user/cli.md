@@ -141,9 +141,14 @@ qrypt fs crypt-decode [MOUNT] "b4l6g..."     # 密文 → 明文（反查本地�
 ```sh
 qrypt driver list [--json]
 qrypt driver schema NAME [--json]
+qrypt driver login quark [--mount NAME] [--config PATH] [--timeout 5m]
 ```
 
 `schema` 展示驱动参数类型、必填项、默认值、示例和敏感字段标记。
+
+`driver login quark` 显示网页授权二维码，用手机夸克 App 扫码并确认后，验证 Cookie 能读取网盘根目录，再写入配置。默认添加或更新名为 `quark` 的挂载；`--mount NAME` 可指定已有夸克挂载并保留其目录、加密等设置。同名挂载使用其他驱动时拒绝覆盖。未发现配置文件时创建 `./qrypt.toml`，也可用 `--config PATH` 指定新文件。失败、超时或 Ctrl-C 取消时不保存凭证；已有挂载需重新打开才能使用新登录。
+
+Cookie 写入权限为 `0600` 的配置文件，不输出到终端。二维码及其中的临时授权 URL 仅用于本次登录，不要分享或记录。夸克读取文件使用 `drive-pc.quark.cn` 的 PC 下载接口，取址与读取采用相同版本的 PC User-Agent；Cookie 只发送给 HTTPS 的夸克及 UC 下载域名。重新登录后不复用旧登录产生的轮换 Cookie；没有登录绑定信息的旧状态文件也会被忽略，改用配置中的 Cookie。
 
 ## 调试
 
@@ -167,7 +172,12 @@ qrypt debug bundle [REMOTE] [--dest DESTINATION] --socket PATH --mount NAME --ou
 [debug]
 enabled = true
 listen = "127.0.0.1:19090"
+token = "<填入 openssl rand -hex 32 生成的随机值>"
 ```
+
+TCP 必须配置至少 32 字符的随机 `token`，否则拒绝启动。配置文件应仅当前用户可读（Unix 上使用 `chmod 600 qrypt.toml`）。CLI 自动读取同一配置中的 token；也可以用 `--token-file PATH` 指定只包含 token 的私有文件，覆盖配置值。token 不接受 URL 查询参数传递，也不要放入命令行参数或分享的诊断包。
+
+TCP 仅监听回环地址，拒绝非回环 Host 及带 Origin 的浏览器请求；HTTP 客户端须发送 `Authorization: Bearer <token>`。`--socket PATH` 使用权限为 `0600` 的 Unix socket，无需 token。
 
 启用后，debug 命令可以省略 `--url`：
 

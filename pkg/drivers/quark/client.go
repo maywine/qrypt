@@ -20,32 +20,36 @@ import (
 )
 
 const (
-	defaultBaseURL    = "https://drive.quark.cn/1/clouddrive"
-	defaultV2URL      = "https://drive.quark.cn/api/v2"
-	defaultReferer    = "https://pan.quark.cn"
-	defaultUserAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/2.5.20 Chrome/100.0.4896.160 Electron/18.3.5.4-b478491100 Safari/537.36 Channel/pckk_other_ch"
-	httpMaxRetries    = 3
-	ossMaxRetries     = 3
-	ossRequestTimeout = 2 * time.Minute
-	ossRetryBaseDelay = 30 * time.Second
-	ossMaxConcurrent  = 4
-	partUploadWorkers = 1
+	defaultBaseURL         = "https://drive.quark.cn/1/clouddrive"
+	defaultDownloadBaseURL = "https://drive-pc.quark.cn/1/clouddrive"
+	defaultV2URL           = "https://drive.quark.cn/api/v2"
+	defaultReferer         = "https://pan.quark.cn"
+	pcClientVersion        = "2.5.56"
+	defaultUserAgent       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/" + pcClientVersion + " Chrome/100.0.4896.160 Electron/18.3.5.12-a038f7b798 Safari/537.36 Channel/pckk_other_ch"
+	webLoginUserAgent      = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	httpMaxRetries         = 3
+	ossMaxRetries          = 3
+	ossRequestTimeout      = 2 * time.Minute
+	ossRetryBaseDelay      = 30 * time.Second
+	ossMaxConcurrent       = 4
+	partUploadWorkers      = 1
 )
 
 type client struct {
-	httpClient     *http.Client
-	downloadClient *http.Client
-	ossClient      *http.Client
-	cookie         string
-	baseURL        string
-	v2URL          string
-	mu             sync.RWMutex
-	sem            chan struct{}
-	mgmtSem        chan struct{}
-	metaSem        chan struct{}
-	ossSem         chan struct{}
-	onCookieUpdate func(cookie string)
-	metrics        *driverutil.Buffer
+	httpClient      *http.Client
+	downloadClient  *http.Client
+	ossClient       *http.Client
+	cookie          string
+	baseURL         string
+	downloadBaseURL string
+	v2URL           string
+	mu              sync.RWMutex
+	sem             chan struct{}
+	mgmtSem         chan struct{}
+	metaSem         chan struct{}
+	ossSem          chan struct{}
+	onCookieUpdate  func(cookie string)
+	metrics         *driverutil.Buffer
 }
 
 func newClient(cookie string, opts clientOptions) *client {
@@ -53,22 +57,27 @@ func newClient(cookie string, opts clientOptions) *client {
 	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
+	downloadBaseURL := strings.TrimRight(opts.BaseURL, "/")
+	if downloadBaseURL == "" {
+		downloadBaseURL = defaultDownloadBaseURL
+	}
 	v2URL := strings.TrimRight(opts.V2URL, "/")
 	if v2URL == "" {
 		v2URL = defaultV2URL
 	}
 	return &client{
-		httpClient:     newHTTPClient(30 * time.Second),
-		downloadClient: newHTTPClient(0),
-		ossClient:      newOSSClient(),
-		cookie:         cookie,
-		baseURL:        baseURL,
-		v2URL:          v2URL,
-		sem:            make(chan struct{}, 200),
-		mgmtSem:        make(chan struct{}, 500),
-		metaSem:        make(chan struct{}, 500),
-		ossSem:         make(chan struct{}, ossMaxConcurrent),
-		metrics:        driverutil.NewBuffer(500),
+		httpClient:      newHTTPClient(30 * time.Second),
+		downloadClient:  newHTTPClient(0),
+		ossClient:       newOSSClient(),
+		cookie:          cookie,
+		baseURL:         baseURL,
+		downloadBaseURL: downloadBaseURL,
+		v2URL:           v2URL,
+		sem:             make(chan struct{}, 200),
+		mgmtSem:         make(chan struct{}, 500),
+		metaSem:         make(chan struct{}, 500),
+		ossSem:          make(chan struct{}, ossMaxConcurrent),
+		metrics:         driverutil.NewBuffer(500),
 	}
 }
 
@@ -78,7 +87,17 @@ type clientOptions struct {
 }
 
 func newHTTPClient(timeout time.Duration) *http.Client {
-	return httputil.NewClient(timeout, 30*time.Second)
+	client := httputil.NewClient(timeout, 30*time.Second)
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if err := validateDownloadURL(req.URL); err != nil {
+			return err
+		}
+		if len(via) >= 10 {
+			return fmt.Errorf("quark: too many redirects")
+		}
+		return nil
+	}
+	return client
 }
 
 func newOSSClient() *http.Client {
@@ -209,6 +228,9 @@ func (c *client) request(ctx context.Context, method, path string, query map[str
 // to the cookie used to obtain it, while the response may rotate __puus.
 func (c *client) requestWithCookie(ctx context.Context, method, path string, query map[string]string, body, result any, cookieSnapshot string) error {
 	base := c.baseURL
+	if path == "/file/download" {
+		base = c.downloadBaseURL
+	}
 	return c.doRequest(ctx, method, base, path, query, body, result, cookieSnapshot)
 }
 
@@ -333,29 +355,36 @@ func (c *client) doRequest(ctx context.Context, method, baseURL, path string, qu
 }
 
 func (c *client) doDownload(req *http.Request, cookieSnapshot string) (*http.Response, error) {
+	if err := validateDownloadURL(req.URL); err != nil {
+		return nil, err
+	}
 	if cookieSnapshot == "" {
 		cookieSnapshot = c.cookieValue()
 	}
 	req.Header.Set("Cookie", cookieSnapshot)
-	// Quark's CDN applies different policies to browser-like download
-	// requests. Keep the API client UA above, but make the signed CDN request
-	// match the request used by the official web client/kuake_cli.
-	req.Header.Set("User-Agent", downloadChromeUA)
+	req.Header.Set("User-Agent", defaultUserAgent)
 	req.Header.Set("Referer", defaultReferer+"/")
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("Pragma", "no-cache")
-	req.Header.Set("Priority", "u=0, i")
-	req.Header.Set("Sec-Ch-Ua", `"Chromium";v="146", "Google Chrome";v="146", "Not_A Brand";v="24"`)
-	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
-	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
-	req.Header.Set("Sec-Fetch-Site", "same-site")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-Dest", "iframe")
-	req.Header.Set("Sec-Fetch-User", "?1")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	return c.downloadClient.Do(req)
+	resp, err := c.downloadClient.Do(req)
+	var requestErr *url.Error
+	if errors.As(err, &requestErr) {
+		// Signed download URLs carry credentials; keep the underlying network
+		// error for retry classification without including the URL in logs.
+		err = requestErr.Err
+	}
+	return resp, err
+}
+
+func validateDownloadURL(u *url.URL) error {
+	if u != nil && u.Scheme == "https" && u.User == nil {
+		host := strings.ToLower(u.Hostname())
+		for _, domain := range []string{"quark.cn", "uc.cn", "ucweb.com"} {
+			if host == domain || strings.HasSuffix(host, "."+domain) {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("quark: untrusted download URL")
 }
 
 func (c *client) recordMetric(ctx context.Context, event drive.MetricEvent) {

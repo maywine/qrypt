@@ -340,7 +340,7 @@ password = "your-password"
 | `password` | string (secret) | 条件 | SFTP password; use password or private_key |
 | `private_key` | string (secret) | 条件 | Path to or PEM-encoded SSH private key; use private_key or password |
 | `passphrase` | string (secret) | 否 | SSH private key passphrase |
-| `known_hosts` | string | 否 | Optional OpenSSH known_hosts file used to verify the SFTP server host key; when omitted, ~/.ssh/known_hosts is used if present |
+| `known_hosts` | string | 否 | OpenSSH known_hosts file used to verify the SFTP server host key; defaults to ~/.ssh/known_hosts. Missing files, unknown hosts and changed keys are rejected |
 | `root_path` | string | 否 | Remote directory used as this mount root，默认 `/` |
 
 ---

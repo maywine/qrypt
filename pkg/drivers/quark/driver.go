@@ -2,6 +2,7 @@ package quark
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"sync"
@@ -62,12 +63,13 @@ func New(cookie string, opts Options) *Driver {
 		rootID = "0"
 	}
 	d := &Driver{
-		cl:           newClient(cookie, clientOptions{BaseURL: opts.BaseURL, V2URL: opts.V2URL}),
-		cookie:       cookie,
-		rootPath:     opts.RootPath,
-		rootID:       rootID,
-		cookieSource: "config",
-		debugUploads: map[string]quarkUploadDebug{},
+		cl:               newClient(cookie, clientOptions{BaseURL: opts.BaseURL, V2URL: opts.V2URL}),
+		cookie:           cookie,
+		configCookieHash: fmt.Sprintf("%x", sha256.Sum256([]byte(cookie))),
+		rootPath:         opts.RootPath,
+		rootID:           rootID,
+		cookieSource:     "config",
+		debugUploads:     map[string]quarkUploadDebug{},
 	}
 	d.cl.onCookieUpdate = d.saveUpdatedCookie
 	return d
@@ -132,6 +134,7 @@ type Driver struct {
 	downloadWarmup     singleflight.Group
 	downloadWarmupDone sync.Map
 	cookie             string
+	configCookieHash   string
 	rootPath           string
 	rootID             string
 	limiter            *drive.BandwidthLimiter
@@ -158,8 +161,9 @@ type Options struct {
 }
 
 type cookieState struct {
-	Cookie    string    `json:"cookie,omitempty"`
-	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	Cookie           string    `json:"cookie,omitempty"`
+	UpdatedAt        time.Time `json:"updated_at,omitempty"`
+	ConfigCookieHash string    `json:"config_cookie_hash,omitempty"`
 }
 
 const quarkSessionFile = "quark_upload_sessions.json"
@@ -253,12 +257,14 @@ func (d *Driver) loadCookieState() {
 	if err != nil {
 		return
 	}
-	if state.Cookie != "" {
+	// A rotated cookie is usable only for the configured login that produced
+	// it. Reconnecting another account must not silently restore the old one.
+	if state.Cookie != "" && state.ConfigCookieHash == d.configCookieHash {
 		d.cookie = state.Cookie
 		d.cl.setCookie(state.Cookie)
 		d.cookieSource = "state"
+		d.cookieUpdated = state.UpdatedAt
 	}
-	d.cookieUpdated = state.UpdatedAt
 }
 
 // validateWithFallback runs validate with the current cookie and, when the
@@ -299,8 +305,9 @@ func (d *Driver) saveUpdatedCookie(cookie string) {
 		return
 	}
 	if err := d.stateStore.SaveJSON("quark_cookie.json", cookieState{
-		Cookie:    cookie,
-		UpdatedAt: d.cookieUpdated,
+		Cookie:           cookie,
+		UpdatedAt:        d.cookieUpdated,
+		ConfigCookieHash: d.configCookieHash,
 	}); err != nil {
 		logging.L.Warnf("[QUARK] save updated cookie state failed: %v", err)
 	}

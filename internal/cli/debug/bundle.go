@@ -12,7 +12,6 @@ import (
 
 	"github.com/spf13/cobra"
 	cliruntime "github.com/yinzhenyu/qrypt/internal/cli/runtime"
-	"github.com/yinzhenyu/qrypt/pkg/control"
 	"github.com/yinzhenyu/qrypt/pkg/util"
 )
 
@@ -70,7 +69,7 @@ func NewBundleCmd(rt cliruntime.Runtime) *cobra.Command {
 			if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
 				return err
 			}
-			client, err := control.NewClient(socket)
+			client, err := debugClient(ctx)
 			if err != nil {
 				return err
 			}

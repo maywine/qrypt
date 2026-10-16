@@ -59,7 +59,7 @@ func init() {
 		drive.ParamDef{Name: "password", Secret: true, Description: "SFTP password", Example: "your-password"},
 		drive.ParamDef{Name: "private_key", Secret: true, Description: "Path to or PEM-encoded SSH private key", Example: "~/.ssh/id_ed25519"},
 		drive.ParamDef{Name: "passphrase", Secret: true, Description: "SSH private key passphrase"},
-		drive.ParamDef{Name: "known_hosts", Description: "OpenSSH known_hosts file used to verify the SFTP server; when omitted, ~/.ssh/known_hosts is used if present", Example: "~/.ssh/known_hosts"},
+		drive.ParamDef{Name: "known_hosts", Description: "OpenSSH known_hosts file used to verify the SFTP server; defaults to ~/.ssh/known_hosts and fails if missing or the server key is untrusted", Example: "~/.ssh/known_hosts"},
 		drive.ParamDef{Name: "root_path", Description: "Remote directory used as this mount root", Default: "/", Example: "/data/qrypt"},
 	)
 }
@@ -145,13 +145,7 @@ func (d *Driver) connect(ctx context.Context) (*ssh.Client, *sftp.Client, error)
 func (d *Driver) hostKeyCallback() (ssh.HostKeyCallback, error) {
 	knownHostsPath := util.ExpandHome(d.knownHosts)
 	if knownHostsPath == "" {
-		defaultPath := util.ExpandHome("~/.ssh/known_hosts")
-		if _, err := os.Stat(defaultPath); err == nil {
-			knownHostsPath = defaultPath
-		}
-	}
-	if knownHostsPath == "" {
-		return ssh.InsecureIgnoreHostKey(), nil
+		knownHostsPath = util.ExpandHome("~/.ssh/known_hosts")
 	}
 	callback, err := knownhosts.New(knownHostsPath)
 	if err != nil {

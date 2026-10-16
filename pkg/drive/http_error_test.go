@@ -117,6 +117,11 @@ func TestSnippetMasksSensitiveValues(t *testing.T) {
 	}{
 		{"query access_token", `{"error":"bad","url":"https://x/a?access_token=abc123&k=v"}`, "abc123"},
 		{"query refresh_token", `url?refresh_token=refreshsecret99`, "refreshsecret99"},
+		{"query refresh_ui", `url?refresh_ui=refresh-ui-secret`, "refresh-ui-secret"},
+		{"query client_secret", `url?client_secret=client-secret-value&ok=1`, "client-secret-value"},
+		{"refresh_ui json", `{"refresh_ui":"refresh-ui-secret"}`, "refresh-ui-secret"},
+		{"client_secret json", `{"client_secret":"client-secret-value"}`, "client-secret-value"},
+		{"escaped secret json", `{"client_secret":"first\"second-secret"}`, "second-secret"},
 		{"sessionKey json", `{"sessionKey":"sess-abcdef","ok":true}`, "sess-abcdef"},
 		{"access_token json", `{"access_token":"tok-abc123","expires":3600}`, "tok-abc123"},
 		{"refresh_token json", `{"refresh_token":"rt-xyz789"}`, "rt-xyz789"},
@@ -124,6 +129,12 @@ func TestSnippetMasksSensitiveValues(t *testing.T) {
 		{"fileDownloadUrl json", `{"fileDownloadUrl":"https://cdn2.example.com/secret.bin"}`, "https://cdn2.example.com/secret.bin"},
 		{"requestURL json", `{"requestURL":"https://api.example.com/private-path"}`, "https://api.example.com/private-path"},
 		{"cookie header", `Cookie: SESSIONID=deadbeef; Path=/`, "deadbeef"},
+		{"second cookie", `Cookie: first=one; second=second-secret; third=three`, "second-secret"},
+		{"third cookie", `Cookie: first=one; second=two; third=third-secret`, "third-secret"},
+		{"set-cookie header", `Set-Cookie: sid=set-cookie-secret; Path=/; HttpOnly`, "set-cookie-secret"},
+		{"cookie json", `{"Cookie":"first=one; second=json-cookie-secret"}`, "json-cookie-secret"},
+		{"cookie header array", `{"Cookie":["first=one", "second=array-cookie-secret"]}`, "array-cookie-secret"},
+		{"authorization json", `{"Authorization":"Bearer json-auth-secret"}`, "json-auth-secret"},
 		{"authorization bearer header", `Authorization: Bearer bearer-token-12345`, "bearer-token-12345"},
 		{"authorization plain header", `Authorization: apikey-xyz`, "apikey-xyz"},
 		{"query token", `url?token=query-token-val`, "query-token-val"},
@@ -166,6 +177,29 @@ func TestSnippetTruncatesLongBodies(t *testing.T) {
 	out := drive.Snippet([]byte(long))
 	if len(out) > 300 {
 		t.Errorf("Snippet did not truncate: len=%d", len(out))
+	}
+}
+
+func TestSnippetRedactsBeforeTruncating(t *testing.T) {
+	input := `{"cookie":"first=one; second=` + strings.Repeat("secret", 100) + `","error":"denied"}`
+	out := drive.Snippet([]byte(input))
+	if strings.Contains(out, "secret") || !strings.Contains(out, "denied") || len(out) > 300 {
+		t.Fatalf("redaction/truncation failed: %q", out)
+	}
+}
+
+func TestHTTPErrorOmitsAllURLCredentialsWithoutChangingRequest(t *testing.T) {
+	const rawURL = "https://user:password@api.example.com/list?refresh%5Fui=refresh-secret&client_secret=client-secret&unknown=opaque-secret#fragment-secret"
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := drive.HTTPError("baidu: list", req, nil, nil).Error()
+	if out != "baidu: list: GET https://api.example.com/list" {
+		t.Fatalf("unexpected diagnostic URL: %q", out)
+	}
+	if req.URL.String() != rawURL {
+		t.Fatal("HTTPError mutated the request URL")
 	}
 }
 

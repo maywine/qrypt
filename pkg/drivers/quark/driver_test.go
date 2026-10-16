@@ -121,12 +121,15 @@ func TestDriverReadRetriesDownloadWithoutRefreshingURL(t *testing.T) {
 		if r.URL.Path != "/file/download" {
 			t.Fatalf("unexpected path: %s", r.URL.Path)
 		}
+		if r.URL.Query().Get("sys") != "win32" || r.URL.Query().Get("ve") != pcClientVersion {
+			t.Fatalf("missing PC download parameters: %v", r.URL.Query())
+		}
 		apiCalls++
 		writeJSON(t, w, map[string]any{
 			"status": 200,
 			"code":   0,
 			"data": []map[string]any{
-				{"download_url": "https://download.test/file.bin"},
+				{"download_url": "https://download.quark.cn/file.bin"},
 			},
 		})
 	}))
@@ -140,8 +143,8 @@ func TestDriverReadRetriesDownloadWithoutRefreshingURL(t *testing.T) {
 		if actualCalls == 1 {
 			return nil, &net.DNSError{Name: req.URL.Host, Err: "no such host"}
 		}
-		if got := req.Header.Get("User-Agent"); got != downloadChromeUA {
-			t.Fatalf("download user-agent = %q, want Chrome UA", got)
+		if got := req.Header.Get("User-Agent"); got != defaultUserAgent {
+			t.Fatalf("download user-agent = %q, want PC client UA", got)
 		}
 		if got := req.Header.Get("Referer"); got != "https://pan.quark.cn/" {
 			t.Fatalf("download referer = %q, want trailing slash", got)
@@ -203,8 +206,8 @@ func TestDriverReadRetriesDownloadWithoutRefreshingURL(t *testing.T) {
 		if got := event.Request["range"]; got != "bytes=4-8" {
 			t.Fatalf("download range = %v, want bytes=4-8", got)
 		}
-		if got := event.Request["url_host"]; got != "download.test" {
-			t.Fatalf("download url_host = %v, want download.test", got)
+		if got := event.Request["url_host"]; got != "download.quark.cn" {
+			t.Fatalf("download url_host = %v, want download.quark.cn", got)
 		}
 		if got := event.Request["url_cache_hit"]; got != false {
 			t.Fatalf("download url_cache_hit = %v, want false", got)
@@ -230,7 +233,7 @@ func TestDriverDownloadUsesCookieSnapshotAfterRotation(t *testing.T) {
 			"status": 200,
 			"code":   0,
 			"data": []map[string]any{
-				{"download_url": "https://download.test/file.bin"},
+				{"download_url": "https://download.quark.cn/file.bin"},
 			},
 		})
 	}))
@@ -332,7 +335,7 @@ func TestDriverParallelDownloadAssemblesRangeParts(t *testing.T) {
 	}
 	result := make(chan downloadResult, 1)
 	go func() {
-		rc, err := driver.downloadParallel(context.Background(), "fid-1", "https://download.test/file.bin", "k=v", false, 0, total)
+		rc, err := driver.downloadParallel(context.Background(), "fid-1", "https://download.quark.cn/file.bin", "k=v", false, 0, total)
 		result <- downloadResult{rc: rc, err: err}
 	}()
 	for range 3 {
@@ -388,7 +391,7 @@ func TestDriverDownloadURLCoalescesConcurrentMisses(t *testing.T) {
 			"status": 200,
 			"code":   0,
 			"data": []map[string]any{
-				{"download_url": "https://download.test/file.bin"},
+				{"download_url": "https://download.quark.cn/file.bin"},
 			},
 		})
 	}))
@@ -401,7 +404,7 @@ func TestDriverDownloadURLCoalescesConcurrentMisses(t *testing.T) {
 		go func() {
 			<-start
 			result, err := driver.downloadURL(context.Background(), "fid-1")
-			if err == nil && result.url != "https://download.test/file.bin" {
+			if err == nil && result.url != "https://download.quark.cn/file.bin" {
 				err = fmt.Errorf("download URL = %q", result.url)
 			}
 			results <- err
@@ -429,12 +432,12 @@ func TestDriverDownloadURLCoalescesConcurrentMisses(t *testing.T) {
 
 func TestDriverInvalidateURLDoesNotDeleteNewerValue(t *testing.T) {
 	driver := New("k=v", Options{})
-	driver.setURL("fid-1", "https://download.test/fresh")
-	driver.invalidateURL("fid-1", "https://download.test/stale")
-	if url, ok := driver.getURL("fid-1"); !ok || url != "https://download.test/fresh" {
+	driver.setURL("fid-1", "https://download.quark.cn/fresh")
+	driver.invalidateURL("fid-1", "https://download.quark.cn/stale")
+	if url, ok := driver.getURL("fid-1"); !ok || url != "https://download.quark.cn/fresh" {
 		t.Fatalf("cached URL = %q/%t, want fresh/true", url, ok)
 	}
-	driver.invalidateURL("fid-1", "https://download.test/fresh")
+	driver.invalidateURL("fid-1", "https://download.quark.cn/fresh")
 	if _, ok := driver.getURL("fid-1"); ok {
 		t.Fatal("matching stale URL was not invalidated")
 	}
@@ -451,7 +454,7 @@ func TestDriverReadRefreshesURLAfterForbidden(t *testing.T) {
 			"status": 200,
 			"code":   0,
 			"data": []map[string]any{
-				{"download_url": fmt.Sprintf("https://download.test/file-%d.bin", apiCalls)},
+				{"download_url": fmt.Sprintf("https://download.quark.cn/file-%d.bin", apiCalls)},
 			},
 		})
 	}))
@@ -497,7 +500,7 @@ func TestDriverReadRefreshesURLAfterForbidden(t *testing.T) {
 
 func TestDriverReadWarmsDownloadConnectionOnce(t *testing.T) {
 	driver := New("k=v", Options{})
-	driver.setURL("fid-1", "https://download.test/file.bin")
+	driver.setURL("fid-1", "https://download.quark.cn/file.bin")
 	var ranges []string
 	driver.cl.downloadClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		ranges = append(ranges, req.Header.Get("Range"))
@@ -568,8 +571,9 @@ func TestCookieUpdatePersistsState(t *testing.T) {
 func TestLoadCookieStateOverridesConfigCookie(t *testing.T) {
 	store := drive.NewFileStateStore(filepath.Join(t.TempDir(), "driver"))
 	if err := store.SaveJSON("quark_cookie.json", cookieState{
-		Cookie:    "stored=1; __puus=stored",
-		UpdatedAt: time.Now(),
+		Cookie:           "stored=1; __puus=stored",
+		UpdatedAt:        time.Now(),
+		ConfigCookieHash: New("config=1", Options{}).configCookieHash,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1657,7 +1661,7 @@ func metricCount(events []drive.MetricEvent, operation string) int {
 
 func TestValidateWithFallbackFallsBackToConfigCookie(t *testing.T) {
 	store := drive.NewFileStateStore(filepath.Join(t.TempDir(), "driver"))
-	if err := store.SaveJSON("quark_cookie.json", cookieState{Cookie: "stored=1"}); err != nil {
+	if err := store.SaveJSON("quark_cookie.json", cookieState{Cookie: "stored=1", ConfigCookieHash: New("config=1", Options{}).configCookieHash}); err != nil {
 		t.Fatal(err)
 	}
 	driver := New("config=1", Options{})
@@ -1696,7 +1700,7 @@ func TestValidateWithFallbackFallsBackToConfigCookie(t *testing.T) {
 
 func TestValidateWithFallbackBothFailReturnsError(t *testing.T) {
 	store := drive.NewFileStateStore(filepath.Join(t.TempDir(), "driver"))
-	if err := store.SaveJSON("quark_cookie.json", cookieState{Cookie: "stored=1"}); err != nil {
+	if err := store.SaveJSON("quark_cookie.json", cookieState{Cookie: "stored=1", ConfigCookieHash: New("config=1", Options{}).configCookieHash}); err != nil {
 		t.Fatal(err)
 	}
 	driver := New("config=1", Options{})
@@ -1719,7 +1723,7 @@ func TestValidateWithFallbackBothFailReturnsError(t *testing.T) {
 
 func TestValidateWithFallbackNoFallbackWithoutConfigCookie(t *testing.T) {
 	store := drive.NewFileStateStore(filepath.Join(t.TempDir(), "driver"))
-	if err := store.SaveJSON("quark_cookie.json", cookieState{Cookie: "stored=1"}); err != nil {
+	if err := store.SaveJSON("quark_cookie.json", cookieState{Cookie: "stored=1", ConfigCookieHash: New("", Options{}).configCookieHash}); err != nil {
 		t.Fatal(err)
 	}
 	driver := New("", Options{})

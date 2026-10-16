@@ -893,6 +893,7 @@ func TestServerExposesHTTPListenEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	server.SetAuthToken(strings.Repeat("t", 32))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := server.Start(ctx); err != nil {
@@ -905,6 +906,7 @@ func TestServerExposesHTTPListenEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	client.SetAuthToken(strings.Repeat("t", 32))
 	body, err := client.Get(context.Background(), "/v1/health")
 	if err != nil {
 		t.Fatal(err)
@@ -928,6 +930,7 @@ func TestServerHealthReportsTaskPersistenceDegraded(t *testing.T) {
 		t.Fatal(err)
 	}
 	server.SetTaskPersistenceHealth(degradedTaskPersistence{})
+	server.SetAuthToken(strings.Repeat("t", 32))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	if err := server.Start(ctx); err != nil {
@@ -939,6 +942,7 @@ func TestServerHealthReportsTaskPersistenceDegraded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	client.SetAuthToken(strings.Repeat("t", 32))
 	body, err := client.Get(context.Background(), "/v1/health")
 	if err != nil {
 		t.Fatal(err)

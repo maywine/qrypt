@@ -98,6 +98,7 @@ type sortResp struct {
 type downResp struct {
 	respEnvelope
 	Data []struct {
+		Fid         string `json:"fid"`
 		DownloadURL string `json:"download_url"`
 	} `json:"data"`
 }

@@ -53,6 +53,7 @@ type Core struct {
 	// their cloud upload records; zero means defaultUploadStreamPollInterval.
 	uploadStreamPollInterval time.Duration
 	debugServer              *control.Server
+	debugToken               string
 	tasks                    *task.Manager
 	uploadSources            UploadSourceProvider
 	readChunkLimit           int
@@ -119,6 +120,7 @@ func Open(ctx context.Context, opts Options) (*Core, error) {
 	}
 	c := &Core{fs: fs, cleanup: cleanup, configPath: opts.ConfigPath, runtimeLayout: runtime, readCacheDir: runtime.ReadCacheDir, thumbnailDir: runtime.ThumbnailDir, thumbnailMax: thumbnailMax, uploadDir: runtime.UploadDir, defaultUploadMount: cfg.Upload.DefaultMount, defaultUploadPath: cfg.Upload.DefaultPath, uploadSources: opts.UploadSources, readChunkLimit: readChunkLimit, mountContentDedup: contentDedupByMount(cfg), vfsCancel: vfsCancel}
 	c.tasks = c.newTaskManager()
+	c.debugToken = cfg.Debug.Token
 	if cfg.Debug.Enabled {
 		if err := c.StartDebugServer(ctx, cfg.Debug.EffectiveListen()); err != nil {
 			// A previous process may still hold the debug socket (e.g. a

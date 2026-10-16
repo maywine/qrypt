@@ -51,6 +51,9 @@ DEBUG_DOC_OVERRIDES = {
     "listen": {
         "description": "HTTP 调试入口监听地址；未设置时使用 `127.0.0.1:19090`。",
     },
+    "token": {
+        "description": "TCP 调试入口必填的随机 Bearer token，至少 32 个字符；配置文件应仅当前用户可读。Unix socket 使用文件权限保护，无需 token。",
+    },
 }
 
 

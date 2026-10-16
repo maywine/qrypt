@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
 	cliruntime "github.com/yinzhenyu/qrypt/internal/cli/runtime"
 	"github.com/yinzhenyu/qrypt/pkg/control"
+	"github.com/yinzhenyu/qrypt/pkg/util"
 )
 
 func NewCommand(rt cliruntime.Runtime) *cobra.Command {
@@ -35,10 +37,12 @@ func NewCommand(rt cliruntime.Runtime) *cobra.Command {
 }
 
 type DebugSocketContextKey struct{}
+type debugTokenContextKey struct{}
 
 func withDebugSocketFlag(rt cliruntime.Runtime, cmd *cobra.Command) *cobra.Command {
 	cmd.Flags().StringP("socket", "s", "", "debug socket path (required)")
 	cmd.Flags().String("url", "", "debug HTTP URL")
+	cmd.Flags().String("token-file", "", "file containing the TCP debug authentication token (overrides debug.token)")
 	run := cmd.RunE
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
 		socket, err := cmd.Flags().GetString("socket")
@@ -56,14 +60,26 @@ func withDebugSocketFlag(rt cliruntime.Runtime, cmd *cobra.Command) *cobra.Comma
 		if endpoint == "" {
 			endpoint = debugURL
 		}
-		if endpoint == "" {
+		tokenFile, _ := cmd.Flags().GetString("token-file")
+		token := ""
+		if endpoint == "" || tokenFile == "" {
 			state, err := rt.CommandConfig(cmd)
 			if err != nil {
 				return err
 			}
-			if state.Cfg != nil && state.Cfg.Debug.Enabled {
-				endpoint = state.Cfg.Debug.EffectiveListen()
+			if state.Cfg != nil {
+				token = state.Cfg.Debug.Token
+				if endpoint == "" && state.Cfg.Debug.Enabled {
+					endpoint = state.Cfg.Debug.EffectiveListen()
+				}
 			}
+		}
+		if tokenFile != "" {
+			data, err := os.ReadFile(util.ExpandHome(tokenFile))
+			if err != nil {
+				return fmt.Errorf("read debug token file: %w", err)
+			}
+			token = strings.TrimSpace(string(data))
 		}
 		if endpoint == "" {
 			return rt.MissingSocketError(cmd)
@@ -72,7 +88,8 @@ func withDebugSocketFlag(rt cliruntime.Runtime, cmd *cobra.Command) *cobra.Comma
 		if ctx == nil {
 			ctx = context.Background()
 		}
-		cmd.SetContext(context.WithValue(ctx, DebugSocketContextKey{}, endpoint))
+		ctx = context.WithValue(ctx, DebugSocketContextKey{}, endpoint)
+		cmd.SetContext(context.WithValue(ctx, debugTokenContextKey{}, token))
 		return run(cmd, args)
 	}
 	return cmd
@@ -83,7 +100,7 @@ func debugSocketFromContext(ctx context.Context) string {
 	return socket
 }
 
-func debugSocketGet(ctx context.Context, endpoint string) ([]byte, error) {
+func debugClient(ctx context.Context) (*control.Client, error) {
 	socket := debugSocketFromContext(ctx)
 	if socket == "" {
 		return nil, fmt.Errorf("missing debug socket in command context")
@@ -92,15 +109,21 @@ func debugSocketGet(ctx context.Context, endpoint string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	token, _ := ctx.Value(debugTokenContextKey{}).(string)
+	client.SetAuthToken(token)
+	return client, nil
+}
+
+func debugSocketGet(ctx context.Context, endpoint string) ([]byte, error) {
+	client, err := debugClient(ctx)
+	if err != nil {
+		return nil, err
+	}
 	return client.Get(ctx, endpoint)
 }
 
 func debugSocketPostJSON(ctx context.Context, endpoint string, value any) ([]byte, error) {
-	socket := debugSocketFromContext(ctx)
-	if socket == "" {
-		return nil, fmt.Errorf("missing debug socket in command context")
-	}
-	client, err := control.NewClient(socket)
+	client, err := debugClient(ctx)
 	if err != nil {
 		return nil, err
 	}

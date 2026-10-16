@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"net"
 	"net/http"
@@ -52,6 +53,13 @@ type Server struct {
 	server     *http.Server
 	listener   net.Listener
 	stop       context.CancelFunc
+	authToken  string
+}
+
+// SetAuthToken configures TCP authentication before Start. Unix sockets use
+// filesystem permissions and do not require a token.
+func (s *Server) SetAuthToken(token string) {
+	s.authToken = token
 }
 
 // SetTaskDebugger attaches the application task journal to the local debug API.
@@ -94,6 +102,11 @@ func NewServer(socketPath string, source Snapshotter) (*Server, error) {
 }
 
 func (s *Server) Start(ctx context.Context) error {
+	if s.network == "tcp" {
+		if len(s.authToken) < 32 || strings.ContainsAny(s.authToken, " \t\r\n") {
+			return fmt.Errorf("control: TCP debug server requires a random debug.token of at least 32 characters")
+		}
+	}
 	if s.network == "unix" {
 		if err := os.MkdirAll(filepath.Dir(s.socketPath), 0o755); err != nil {
 			return err
@@ -140,7 +153,11 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/v1/upload-memory", s.handleUploadMemory)
 	mux.HandleFunc("/v1/goroutines", s.handleGoroutines)
 	mux.HandleFunc("/v1/debug/stacks", s.handleGoroutines)
-	s.server = &http.Server{Handler: mux}
+	var handler http.Handler = mux
+	if s.network == "tcp" {
+		handler = s.authenticate(mux)
+	}
+	s.server = &http.Server{Handler: handler}
 	// Derive our own context so the goroutine below exits on Close even when
 	// the caller passed a background context (context.Background().Done() is
 	// nil, which would block the <-ctx.Done() receive forever).
@@ -157,6 +174,31 @@ func (s *Server) Start(ctx context.Context) error {
 	}()
 	logging.L.Infof("[CONTROL] listening %s", s.ListenAddress())
 	return nil
+}
+
+func (s *Server) authenticate(next http.Handler) http.Handler {
+	// Capture the token so later configuration changes cannot race requests.
+	authorization := "Bearer " + s.authToken
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, requestPort, err := net.SplitHostPort(r.Host)
+		ip := net.ParseIP(host)
+		if err != nil || !isNumericPort(requestPort) || (host != "localhost" && (ip == nil || !ip.IsLoopback())) {
+			http.Error(w, "invalid debug Host", http.StatusForbidden)
+			return
+		}
+		// This is a native-client API, not a browser API. Reject cross-origin
+		// requests even when a browser can reach the loopback listener.
+		if len(r.Header.Values("Origin")) != 0 {
+			http.Error(w, "browser debug requests are not allowed", http.StatusForbidden)
+			return
+		}
+		if len(r.Header.Values("Authorization")) != 1 || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte(authorization)) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "debug authentication required", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func removeStaleSocket(path string) error {

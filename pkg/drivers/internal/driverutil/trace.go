@@ -39,6 +39,9 @@ func (b *Buffer) Record(ctx context.Context, event drive.MetricEvent) {
 	if event.Layer == "" {
 		event.Layer = "driver.http"
 	}
+	if event.Error != "" {
+		event.Error = drive.Snippet([]byte(event.Error))
+	}
 	event.SensitiveMasked = true
 	b.mu.Lock()
 	defer b.mu.Unlock()

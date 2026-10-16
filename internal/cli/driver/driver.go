@@ -1,6 +1,7 @@
 package driver
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/spf13/cobra"
@@ -8,15 +9,22 @@ import (
 	"github.com/yinzhenyu/qrypt/pkg/drive"
 )
 
-func NewCommand(rt cliruntime.ErrorFactory) *cobra.Command {
+type LoginRuntime interface {
+	cliruntime.ErrorFactory
+	CommandConfigPath(*cobra.Command) (string, error)
+	ShutdownContext(*cobra.Command) (context.Context, func())
+}
+
+func NewCommand(rt LoginRuntime) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "driver",
-		Short: "List drivers and show parameter schemas",
+		Short: "Inspect drivers and log in",
 		Args:  cliruntime.CommandGroupArgs(rt, nil),
 		RunE:  cliruntime.ShowHelp,
 	}
 	cmd.AddCommand(NewListCmd(rt))
 	cmd.AddCommand(NewSchemaCmd(rt))
+	cmd.AddCommand(NewLoginCmd(rt))
 	return cmd
 }
 

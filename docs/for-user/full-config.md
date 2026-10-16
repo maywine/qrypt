@@ -108,6 +108,7 @@ sync 会话固定保存在有效工作目录的 `sync/` 子目录。
 |---|---|---|---|
 | `enabled` | boolean | false | Enable the HTTP debug server. |
 | `listen` | string | 127.0.0.1:19090 | HTTP 调试入口监听地址；未设置时使用 `127.0.0.1:19090`。 |
+| `token` | string | - | TCP 调试入口必填的随机 Bearer token，至少 32 个字符；配置文件应仅当前用户可读。Unix socket 使用文件权限保护，无需 token。 |
 
 ## 时间同步（NTP）
 

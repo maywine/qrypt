@@ -293,6 +293,7 @@ func TestLoadDebugConfig(t *testing.T) {
 [debug]
 enabled = true
 listen = "127.0.0.1:19090"
+token = "test-debug-token-at-least-32-characters"
 `), 0o644)
 	if err != nil {
 		t.Fatal(err)
@@ -307,6 +308,9 @@ listen = "127.0.0.1:19090"
 	}
 	if cfg.Debug.EffectiveListen() != "127.0.0.1:19090" {
 		t.Fatalf("unexpected debug listen: %q", cfg.Debug.EffectiveListen())
+	}
+	if cfg.Debug.Token != "test-debug-token-at-least-32-characters" {
+		t.Fatal("debug token not loaded")
 	}
 }
 

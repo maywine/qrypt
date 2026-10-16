@@ -66,6 +66,7 @@ func NewCommand(rt cliruntime.Runtime) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				controlServer.SetAuthToken(state.Cfg.Debug.Token)
 				if err := controlServer.Start(ctx); err != nil {
 					return err
 				}

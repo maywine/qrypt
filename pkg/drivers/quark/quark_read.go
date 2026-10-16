@@ -33,8 +33,6 @@ const (
 	downloadParallelWorkers  = 3
 )
 
-const downloadChromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-
 func (d *Driver) Read(ctx context.Context, entry drive.Entry, offset, size int64) (io.ReadCloser, error) {
 	start := time.Now()
 	var staleURL string
@@ -397,7 +395,9 @@ func (d *Driver) downloadURL(ctx context.Context, fid string) (downloadURLResult
 		}
 		var resp downResp
 		cookieSnapshot := d.cl.cookieValue()
-		if err := d.cl.requestWithCookie(ctx, http.MethodPost, "/file/download", nil, map[string]any{
+		if err := d.cl.requestWithCookie(ctx, http.MethodPost, "/file/download", map[string]string{
+			"sys": "win32", "ve": pcClientVersion, "ut": "", "guid": "",
+		}, map[string]any{
 			"fids": []string{fid},
 		}, &resp, cookieSnapshot); err != nil {
 			return nil, fmt.Errorf("quark: get download url: %w", err)
@@ -408,9 +408,18 @@ func (d *Driver) downloadURL(ctx context.Context, fid string) (downloadURLResult
 		if len(resp.Data) == 0 {
 			return nil, fmt.Errorf("quark: no download url found")
 		}
-		url := resp.Data[0].DownloadURL
-		d.setURLWithCookie(fid, url, cookieSnapshot)
-		return downloadURLResult{url: url, cookie: cookieSnapshot}, nil
+		for _, file := range resp.Data {
+			if file.Fid != "" && file.Fid != fid {
+				continue
+			}
+			u, err := url.Parse(file.DownloadURL)
+			if err != nil || validateDownloadURL(u) != nil {
+				return nil, fmt.Errorf("quark: untrusted download URL")
+			}
+			d.setURLWithCookie(fid, file.DownloadURL, cookieSnapshot)
+			return downloadURLResult{url: file.DownloadURL, cookie: cookieSnapshot}, nil
+		}
+		return nil, fmt.Errorf("quark: download response does not match file")
 	})
 	if err != nil {
 		d.recordDownloadURLMetric(ctx, fid, "", false, started, err)

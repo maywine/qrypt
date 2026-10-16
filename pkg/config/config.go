@@ -144,6 +144,7 @@ type LoggingConfig struct {
 type DebugConfig struct {
 	Enabled bool   `toml:"enabled"`
 	Listen  string `toml:"listen"`
+	Token   string `toml:"token"`
 }
 
 const DefaultDebugListen = "127.0.0.1:19090"

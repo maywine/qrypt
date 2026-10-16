@@ -10,18 +10,12 @@ import (
 )
 
 var sensitiveSnippetPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?i)(access_token=)[^&\s"']+`),
-	regexp.MustCompile(`(?i)(refresh_token=)[^&\s"']+`),
-	regexp.MustCompile(`(?i)(sessionKey=)[^,\s"']+`),
-	regexp.MustCompile(`(?i)("access_token"\s*:\s*")[^"]+`),
-	regexp.MustCompile(`(?i)("refresh_token"\s*:\s*")[^"]+`),
-	regexp.MustCompile(`(?i)("sessionKey"\s*:\s*")[^"]+`),
-	regexp.MustCompile(`(?i)("downloadUrl"\s*:\s*")[^"]+`),
-	regexp.MustCompile(`(?i)("fileDownloadUrl"\s*:\s*")[^"]+`),
-	regexp.MustCompile(`(?i)("requestURL"\s*:\s*")[^"]+`),
-	regexp.MustCompile(`(?i)(Cookie:\s*)[^,\s"']+`),
-	regexp.MustCompile(`(?i)(Authorization:\s*(?:Bearer\s+)?)[^,\s"']+`),
-	regexp.MustCompile(`(?i)(token=)[^&\s"']+`),
+	regexp.MustCompile(`(?i)(\b(?:access_token|refresh_token|refresh_ui|client_secret|sessionKey|token)=)[^&\s"']+`),
+	regexp.MustCompile(`(?i)("(?:access_token|refresh_token|refresh_ui|client_secret|sessionKey|token|downloadUrl|fileDownloadUrl|requestURL|cookie|set-cookie|authorization)"\s*:\s*")(?:\\.|[^"\\])+`),
+	regexp.MustCompile(`(?i)("(?:cookie|set-cookie|authorization)"\s*:\s*\[)(?:\s*"(?:\\.|[^"\\])*"\s*,?)*`),
+	// Cookie headers can contain several credentials separated by spaces or
+	// semicolons. Mask the whole header, not only the first cookie.
+	regexp.MustCompile(`(?i)(\b(?:cookie|set-cookie|authorization):[ \t]*)[^\r\n]+`),
 	// URL userinfo (user:password@) - webdav-style endpoints can embed
 	// credentials in the request URL itself.
 	regexp.MustCompile(`(://)[^/@\s]+@`),
@@ -31,12 +25,12 @@ var sensitiveSnippetPatterns = []*regexp.Regexp{
 // error strings and metric payloads.
 func Snippet(raw []byte) string {
 	raw = bytes.TrimSpace(raw)
-	if len(raw) > 300 {
-		raw = raw[:300]
-	}
 	snippet := string(raw)
 	for _, pattern := range sensitiveSnippetPatterns {
 		snippet = pattern.ReplaceAllString(snippet, "${1}<masked>")
+	}
+	if len(snippet) > 300 {
+		snippet = snippet[:300]
 	}
 	return snippet
 }
@@ -47,8 +41,7 @@ func Snippet(raw []byte) string {
 //
 //	<prefix>: METHOD <redacted-URL>: <status> (body: <redacted-snippet>)
 //
-// The request URL goes through Snippet, masking query tokens (token=,
-// access_token=, sessionKey=, ...) and any embedded credentials; the
+// The request URL omits query parameters, fragments and embedded credentials;
 // response body is truncated to 300 bytes and masked for tokens, cookies,
 // download URLs and authorization headers. req and body are optional and
 // omitted when nil/empty; a nil resp is allowed for transport failures.
@@ -65,7 +58,11 @@ func HTTPError(prefix string, req *http.Request, resp *http.Response, body []byt
 		b.WriteString(": ")
 		b.WriteString(req.Method)
 		b.WriteString(" ")
-		b.WriteString(Snippet([]byte(req.URL.String())))
+		u := *req.URL
+		u.User = nil
+		u.RawQuery, u.Fragment, u.RawFragment = "", "", ""
+		u.ForceQuery = false
+		b.WriteString(Snippet([]byte(u.String())))
 	}
 	if resp != nil {
 		b.WriteString(": ")

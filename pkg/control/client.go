@@ -17,6 +17,11 @@ type Client struct {
 	socketPath string
 	baseURL    string
 	httpClient *http.Client
+	authToken  string
+}
+
+func (c *Client) SetAuthToken(token string) {
+	c.authToken = token
 }
 
 func NewClient(socketPath string) (*Client, error) {
@@ -25,8 +30,11 @@ func NewClient(socketPath string) (*Client, error) {
 	}
 	if baseURL, ok := clientHTTPBaseURL(socketPath); ok {
 		return &Client{
-			baseURL:    baseURL,
-			httpClient: &http.Client{},
+			baseURL: baseURL,
+			httpClient: &http.Client{
+				// Never forward debug credentials to a redirected endpoint.
+				CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+			},
 		}, nil
 	}
 	socketPath = util.ExpandHome(socketPath)
@@ -66,6 +74,9 @@ func (c *Client) PostJSON(ctx context.Context, path string, value any) ([]byte, 
 }
 
 func (c *Client) do(req *http.Request, path string) ([]byte, error) {
+	if c.baseURL != "" && c.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.authToken)
+	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, err

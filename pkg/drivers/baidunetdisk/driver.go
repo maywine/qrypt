@@ -456,6 +456,13 @@ func (d *Driver) requestToken(ctx context.Context, method, rawURL string, body i
 	}
 	start := time.Now()
 	resp, err := d.httpClient.Do(req)
+	// net/http includes the credential-bearing refresh URL in transport
+	// errors, before HTTPError can redact it. Keep the underlying error.
+	if urlErr, ok := err.(*url.Error); ok {
+		redacted := *urlErr
+		redacted.URL = driverutil.URL(req.URL)
+		err = &redacted
+	}
 	d.recordHTTP(ctx, "token", req, resp, start, nil, err)
 	if err != nil {
 		return err

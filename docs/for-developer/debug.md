@@ -92,6 +92,7 @@ Or enable the debug server from the config:
 [debug]
 enabled = true
 listen = "127.0.0.1:19090"
+token = "<paste output of openssl rand -hex 32>"
 ```
 
 Then connect over HTTP:
@@ -125,6 +126,15 @@ live socket and removes stale socket files during startup.
 HTTP debug listeners must bind to loopback addresses such as `127.0.0.1` or
 `localhost`. This keeps Android and remote-device debugging usable through
 tools such as `adb forward` without exposing the debug API on the LAN.
+
+TCP listeners require a random `debug.token` of at least 32 characters; startup
+fails without it. Keep the config readable only by its owner (`chmod 600` on
+Unix). CLI debug commands read the token from the config, including when
+`--url` is supplied; `--token-file PATH` overrides it with a private file
+containing just the token. Other native clients must send
+`Authorization: Bearer <token>`. Tokens in query parameters are not accepted.
+Requests with a non-loopback Host or any Origin header are rejected. Browser
+access is not supported. Unix sockets do not require a token.
 
 ### Enable Debug Logs
 

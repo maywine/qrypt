@@ -157,7 +157,7 @@ func TestLiveSFTPCRUD(t *testing.T) {
 	if address == "" || keyPath == "" || rootPath == "" {
 		t.Skip("QRYPT_SFTP_TEST_ADDR, QRYPT_SFTP_TEST_KEY, and QRYPT_SFTP_TEST_ROOT are required")
 	}
-	driver := New(Options{Address: address, Username: os.Getenv("QRYPT_SFTP_TEST_USER"), PrivateKey: keyPath, RootPath: rootPath})
+	driver := New(Options{Address: address, Username: os.Getenv("QRYPT_SFTP_TEST_USER"), PrivateKey: keyPath, KnownHosts: os.Getenv("QRYPT_SFTP_TEST_KNOWN_HOSTS"), RootPath: rootPath})
 	ctx := context.Background()
 	if err := driver.Init(ctx); err != nil {
 		t.Fatal(err)

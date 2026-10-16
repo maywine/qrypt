@@ -333,6 +333,11 @@
           "description": "Address where the HTTP debug server listens.",
           "type": "string",
           "default": "127.0.0.1:19090"
+        },
+        "token": {
+          "description": "Random bearer token of at least 32 characters, required for TCP debug listeners. Keep the configuration private. Unix sockets use filesystem permissions instead.",
+          "type": "string",
+          "writeOnly": true
         }
       },
       "additionalProperties": false
@@ -1222,7 +1227,7 @@
           "x-secret": true
         },
         "known_hosts": {
-          "description": "Optional OpenSSH known_hosts file used to verify the SFTP server host key; when omitted, ~/.ssh/known_hosts is used if present.",
+              "description": "OpenSSH known_hosts file used to verify the SFTP server host key; defaults to ~/.ssh/known_hosts. Missing files, unknown hosts and changed keys are rejected.",
           "type": "string",
           "x-example": "~/.ssh/known_hosts"
         },
