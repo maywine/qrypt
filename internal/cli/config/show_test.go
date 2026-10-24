@@ -4,63 +4,13 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/BurntSushi/toml"
 	_ "github.com/yinzhenyu/qrypt/pkg/drivers/all"
 )
-
-// TestMaskLine covers the config-show redaction logic: only keys known to be
-// secrets are masked, values survive quoting and embedded '=' characters,
-// empty values render as empty strings, and non-key lines pass through.
-func TestMaskLine(t *testing.T) {
-	secrets := map[string]bool{"password": true, "refresh_token": true}
-	tests := []struct {
-		name string
-		line string
-		want string
-	}{
-		{"plain key unchanged", "name = qrypt", "name = qrypt"},
-		{"secret bare value", "password = hunter2", `password = "******"`},
-		{"secret quoted value", `refresh_token = "abc"`, `refresh_token = "******"`},
-		{"secret empty value", "password =", `password = ""`},
-		{"secret empty quoted", `password = ""`, `password = ""`},
-		{"secret value with equals", "password = a=b=c", `password = "******"`},
-		{"secret key padded", "  password  =  hunter2  ", `password = "******"`},
-		{"no equals passthrough", "some bare line", "some bare line"},
-		{"inline comment kept", "root_path = /tmp/x # local dir", "root_path = /tmp/x # local dir"},
-	}
-	for _, tt := range tests {
-		if got := MaskLine(tt.line, secrets); got != tt.want {
-			t.Errorf("%s: maskLine(%q) = %q, want %q", tt.name, tt.line, got, tt.want)
-		}
-	}
-}
-
-// TestMaskHidesEverything ensures mask never leaks the input (it is the one
-// place every secret passes through).
-func TestMaskHidesEverything(t *testing.T) {
-	if got := Mask("super-secret-value"); got != "******" {
-		t.Fatalf("mask() = %q, want ******", got)
-	}
-}
-
-// TestIsSectionHeader covers the TOML section detection used to insert blank
-// lines between mount blocks in config show output.
-func TestIsSectionHeader(t *testing.T) {
-	headers := []string{"[mounts.local]", "[mounts.quark]", "[mounts.\"weird name\"]"}
-	for _, h := range headers {
-		if !IsSectionHeader(h) {
-			t.Errorf("isSectionHeader(%q) = false, want true", h)
-		}
-	}
-	nonHeaders := []string{"", "plain", "[unclosed", "closed]", "  [padded]  ", "[mounts.local] extra", "key = [not-a-header]"}
-	for _, h := range nonHeaders {
-		if IsSectionHeader(h) {
-			t.Errorf("isSectionHeader(%q) = true, want false", h)
-		}
-	}
-}
 
 // TestConfigShowMasksSecrets is the end-to-end guarantee: running
 // `qrypt config show` on a config with driver secrets must never print the
@@ -121,5 +71,169 @@ cookie = ""
 	}
 	if !strings.Contains(got, `base_url = "https://example.com"`) {
 		t.Fatalf("config show hid base_url:\n%s", got)
+	}
+}
+
+func TestConfigShowMasksTOMLValues(t *testing.T) {
+	for _, tc := range []struct {
+		name, input, want string
+	}{
+		{
+			name: "debug token",
+			input: `[debug]
+enabled = true
+listen = "127.0.0.1:19090"
+token = "audit-secret-debug-token-0123456789"
+`,
+			want: `[debug]
+enabled = true
+listen = "127.0.0.1:19090"
+token = "******"
+`,
+		},
+		{
+			name:  "quoted key",
+			input: `encryption."password" = "audit-secret-password"`,
+			want:  `encryption.password = "******"`,
+		},
+		{
+			name:  "escaped key and value",
+			input: `encryption."\u0070assword" = "audit-secret-\u0070assword"`,
+			want:  `encryption.password = "******"`,
+		},
+		{
+			name:  "case insensitive config field",
+			input: `Encryption.Password = "audit-secret-password"`,
+			want:  `Encryption.Password = "******"`,
+		},
+		{
+			name:  "unicode case folding",
+			input: `encryption."paſſword" = "audit-secret-password"`,
+			want:  `encryption."paſſword" = "******"`,
+		},
+		{
+			name: "multiline private key",
+			input: `[[mounts]]
+name = "sftp"
+type = "sftp"
+[mounts.params]
+private_key = """
+-----BEGIN OPENSSH PRIVATE KEY-----
+audit-secret-key-body
+-----END OPENSSH PRIVATE KEY-----
+"""
+`,
+			want: `[[mounts]]
+name = "sftp"
+type = "sftp"
+[mounts.params]
+private_key = "******"
+`,
+		},
+		{
+			name: "multiline literal password",
+			input: `[encryption]
+password = '''
+audit-secret-line-one
+audit-secret-line-two
+'''
+salt = ""
+`,
+			want: `encryption = {password = "******", salt = ""}`,
+		},
+		{
+			name: "inline params and empty secrets",
+			input: `[[mounts]]
+name = "quark"
+type = "quark"
+params = {cookie = "audit-secret-cookie", root_path = "/keep", retry = 2, enabled = true}
+[[mounts]]
+name = "other"
+type = "quark"
+params = {cookie = ""}
+`,
+			want: `[[mounts]]
+name = "quark"
+type = "quark"
+params = {cookie = "******", root_path = "/keep", retry = 2, enabled = true}
+[[mounts]]
+name = "other"
+type = "quark"
+params = {cookie = ""}
+`,
+		},
+		{
+			name:  "inline mount array",
+			input: `mounts = [{name = "quark", type = "quark", params = {cookie = "audit-secret-cookie"}}]`,
+			want: `[[mounts]]
+name = "quark"
+type = "quark"
+params = {cookie = "******"}
+`,
+		},
+		{
+			name: "nested tables and unknown settings",
+			input: `defaults.encryption = {password = "audit-secret-password", salt = "audit-secret-salt"}
+extra = {label = "keep", nested = [{cookie = "audit-secret-cookie"}]}
+`,
+			want: `defaults.encryption = {password = "******", salt = "******"}
+[extra]
+label = "keep"
+[[extra.nested]]
+cookie = "******"
+`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "qrypt.toml")
+			if err := os.WriteFile(configPath, []byte(tc.input), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := NewShowCmd(newTestRuntime())
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			if err := cmd.Flags().Set("config", configPath); err != nil {
+				t.Fatal(err)
+			}
+			if err := cmd.RunE(cmd, nil); err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(out.String(), "audit-secret") || strings.Contains(out.String(), "PRIVATE KEY") {
+				t.Fatalf("config show leaked credentials: %s", out.String())
+			}
+			var got, want map[string]any
+			if err := toml.Unmarshal(out.Bytes(), &got); err != nil {
+				t.Fatalf("output is not valid TOML: %v", err)
+			}
+			if err := toml.Unmarshal([]byte(tc.want), &want); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("config show = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestConfigShowParseErrorDoesNotLeakSecrets(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "qrypt.toml")
+	if err := os.WriteFile(configPath, []byte("[debug]\ntoken = audit-secret-unquoted\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := NewShowCmd(newTestRuntime())
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Flags().Set("config", configPath); err != nil {
+		t.Fatal(err)
+	}
+	err := cmd.RunE(cmd, nil)
+	if err == nil {
+		t.Fatal("config show accepted invalid TOML")
+	}
+	if strings.Contains(err.Error(), "audit-secret") || out.Len() != 0 {
+		t.Fatalf("config show leaked invalid input: output=%q err=%v", out.String(), err)
+	}
+	if !strings.Contains(err.Error(), "line 2") {
+		t.Fatalf("parse error lost its location: %v", err)
 	}
 }

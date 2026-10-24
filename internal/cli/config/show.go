@@ -8,7 +8,6 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/spf13/cobra"
 	cliruntime "github.com/yinzhenyu/qrypt/internal/cli/runtime"
-	"github.com/yinzhenyu/qrypt/pkg/config"
 	"github.com/yinzhenyu/qrypt/pkg/drive"
 )
 
@@ -30,12 +29,16 @@ func NewShowCmd(rt cliruntime.Runtime) *cobra.Command {
 				return fmt.Errorf("read config: %w", err)
 			}
 
-			var cfg config.Config
+			var cfg map[string]any
 			if err := toml.Unmarshal(raw, &cfg); err != nil {
-				return fmt.Errorf("parse config: %w", err)
+				// Parser errors can include credential values from the input.
+				if parseErr, ok := err.(toml.ParseError); ok {
+					return fmt.Errorf("parse config: invalid TOML at line %d", parseErr.Position.Line)
+				}
+				return fmt.Errorf("parse config: invalid TOML")
 			}
 
-			knownSecrets := map[string]bool{"password": true, "salt": true}
+			knownSecrets := map[string]bool{"password": true, "salt": true, "token": true}
 			for _, name := range drive.Names() {
 				for _, p := range drive.ParamSchema(name) {
 					if p.Secret {
@@ -44,49 +47,34 @@ func NewShowCmd(rt cliruntime.Runtime) *cobra.Command {
 				}
 			}
 
-			lines := strings.Split(string(raw), "\n")
-			masked := make([]string, 0, len(lines))
-			for _, line := range lines {
-				trimmed := strings.TrimSpace(line)
-				if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-					continue
-				}
-				if IsSectionHeader(trimmed) && len(masked) > 0 && masked[len(masked)-1] != "" {
-					masked = append(masked, "")
-				}
-				masked = append(masked, MaskLine(line, knownSecrets))
-			}
-
-			fmt.Fprintln(cmd.OutOrStdout(), strings.Join(masked, "\n"))
-			return nil
+			maskSecrets(cfg, knownSecrets)
+			return toml.NewEncoder(cmd.OutOrStdout()).Encode(cfg)
 		},
 	}
 	rt.WithConfigFlag(cmd)
 	return cmd
 }
 
-func MaskLine(line string, secrets map[string]bool) string {
-	line = strings.TrimRight(line, " \t\r\n")
-	before, after, ok := strings.Cut(line, "=")
-	if !ok {
-		return line
+func maskSecrets(value any, secrets map[string]bool) {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, child := range value {
+			// Match the TOML decoder's Unicode case folding for struct fields.
+			for secret := range secrets {
+				if strings.EqualFold(key, secret) && child != "" {
+					value[key] = "******"
+					break
+				}
+			}
+			maskSecrets(value[key], secrets)
+		}
+	case []map[string]any:
+		for _, child := range value {
+			maskSecrets(child, secrets)
+		}
+	case []any:
+		for _, child := range value {
+			maskSecrets(child, secrets)
+		}
 	}
-	key := strings.TrimSpace(before)
-	if !secrets[key] {
-		return line
-	}
-	val := strings.TrimSpace(after)
-	val = strings.Trim(val, `"'`)
-	if val == "" {
-		return key + ` = ""`
-	}
-	return key + ` = "` + Mask(val) + `"`
-}
-
-func Mask(s string) string {
-	return "******"
-}
-
-func IsSectionHeader(line string) bool {
-	return strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]")
 }
