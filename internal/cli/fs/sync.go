@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/yinzhenyu/qrypt/internal/cli/i18n"
 	cliruntime "github.com/yinzhenyu/qrypt/internal/cli/runtime"
 	"github.com/yinzhenyu/qrypt/pkg/core"
 	syncer "github.com/yinzhenyu/qrypt/pkg/syncer"
@@ -28,6 +29,8 @@ compared against the VFS plaintext view (encryption is transparent).
 
 Exit code: 0 on success (also for --dry-run plans), 3 when some files
 failed, 2 on usage errors, 1 on overall failures.`,
+		Example: `  qrypt fs sync ./photos /cloud/photos
+  qrypt fs sync /cloud/photos ./photos --delete --dry-run`,
 		Args:              cliruntime.ExactNamedArgs(rt, "SOURCE", "DESTINATION"),
 		RunE:              runSync(rt),
 		ValidArgsFunction: cliruntime.NoFileCompletions,
@@ -100,7 +103,7 @@ func FinishSync(rt cliruntime.Runtime, cmd *cobra.Command, result syncer.Result,
 			return err
 		}
 	} else {
-		syncer.PrintSummary(cmd.OutOrStdout(), result)
+		PrintSyncSummary(cmd.OutOrStdout(), result, i18n.FromCommand(cmd))
 	}
 	if result.Summary.Failed > 0 {
 		return rt.ExitError(cliruntime.ExitPartial, fmt.Errorf("sync finished with %d failed item(s)", result.Summary.Failed))

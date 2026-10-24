@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/yinzhenyu/qrypt/internal/cli/i18n"
 	cliruntime "github.com/yinzhenyu/qrypt/internal/cli/runtime"
-	"github.com/yinzhenyu/qrypt/pkg/control"
 	"github.com/yinzhenyu/qrypt/pkg/logging"
 	"github.com/yinzhenyu/qrypt/pkg/mount"
 	"github.com/yinzhenyu/qrypt/pkg/util"
@@ -19,7 +19,9 @@ func NewCommand(rt cliruntime.Runtime) *cobra.Command {
 		Use:   "mount [MOUNT_NAME]",
 		Short: "Mount configured drives with FUSE",
 		Long:  "Mount all configured drives as one local FUSE filesystem, or mount one configured drive by name. Uses mount_point from config unless --mount-point is set.",
-		Args:  cliruntime.MaxArgs(rt, 1),
+		Example: `  qrypt mount
+  qrypt mount cloud --mount-point /mnt/qrypt`,
+		Args: cliruntime.MaxArgs(rt, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			state, err := rt.CommandConfig(cmd)
 			if err != nil {
@@ -31,47 +33,26 @@ func NewCommand(rt cliruntime.Runtime) *cobra.Command {
 			ctx, stop := rt.ShutdownContext(cmd)
 			defer stop()
 
-			socket, _ := cmd.Flags().GetString("socket")
-			debugListen := socket
-			if debugListen == "" && state.Cfg.Debug.Enabled {
-				debugListen = state.Cfg.Debug.EffectiveListen()
-			}
+			debugListen := ""
 			mountPointFlag, _ := cmd.Flags().GetString("mount-point")
 			selectedMount := ""
 			if len(args) == 1 {
 				selectedMount = args[0]
 			}
 
-			fs, cleanup, err := rt.BuildFileSystemForMount(ctx, state.Cfg, selectedMount)
+			coreHost, err := rt.OpenCoreForMount(ctx, state.Cfg, state.Path, selectedMount, debugListen, "")
 			if err != nil {
 				return err
 			}
 			defer func() {
-				// Shut down in dependency order: the unmount defer runs first
-				// (stops new FUSE requests), then wait for the filesystem's
-				// workers to finish, then clean up external resources.
-				if err := fs.Close(context.Background()); err != nil {
-					logging.L.Warnf("[CLI] filesystem close: %v", err)
+				// Core owns the filesystem, task manager, debug server and
+				// external driver cleanup. It is closed only after the unmount
+				// defer has stopped new FUSE requests.
+				if err := coreHost.Close(context.Background()); err != nil {
+					logging.L.Warnf("[CLI] core close: %v", err)
 				}
-				cleanup()
 			}()
-			fs.Start(ctx)
-
-			if debugListen != "" {
-				snapshotter, ok := fs.(control.Snapshotter)
-				if !ok {
-					return fmt.Errorf("debug socket requires filesystem debug snapshots")
-				}
-				controlServer, err := control.NewServer(debugListen, snapshotter)
-				if err != nil {
-					return err
-				}
-				controlServer.SetAuthToken(state.Cfg.Debug.Token)
-				if err := controlServer.Start(ctx); err != nil {
-					return err
-				}
-				defer controlServer.Close(context.Background())
-			}
+			fs := coreHost.FileSystem()
 
 			mountPoint := ""
 			if mountPointFlag != "" {
@@ -90,8 +71,9 @@ func NewCommand(rt cliruntime.Runtime) *cobra.Command {
 			}
 
 			mountPointExpanded := util.ExpandHome(mountPoint)
+			loc := i18n.FromCommand(cmd)
 			logging.L.Infof("Mounting at %s ...", mountPointExpanded)
-			fmt.Fprintf(cmd.ErrOrStderr(), "Mounting at %s ...\n", mountPointExpanded)
+			fmt.Fprintf(cmd.ErrOrStderr(), "%s\n", loc.T("out.mount.mounting", mountPointExpanded))
 			mountOpts.MountPoint = mountPointExpanded
 			mountOpts.Foreground = true
 			session, err := mount.NewMounter().Mount(ctx, fs, mountOpts)
@@ -109,7 +91,7 @@ func NewCommand(rt cliruntime.Runtime) *cobra.Command {
 			unmount := func() {
 				unmountOnce.Do(func() {
 					logging.L.Infof("Unmounting %s ...", mountPointExpanded)
-					fmt.Fprintln(cmd.ErrOrStderr(), "Unmounting ...")
+					fmt.Fprintf(cmd.ErrOrStderr(), "%s\n", loc.T("out.mount.unmounting", mountPointExpanded))
 					uctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 					defer cancel()
 					if err := mount.NewMounter().Unmount(uctx, session); err != nil {
@@ -119,7 +101,7 @@ func NewCommand(rt cliruntime.Runtime) *cobra.Command {
 			}
 			defer unmount()
 			logging.L.Infof("Mounted at %s. Press Ctrl+C to unmount.", mountPointExpanded)
-			fmt.Fprintf(cmd.ErrOrStderr(), "Mounted at %s. Press Ctrl+C to unmount.\n", mountPointExpanded)
+			fmt.Fprintf(cmd.ErrOrStderr(), "%s\n", loc.T("out.mount.mounted", mountPointExpanded))
 			if prefetcher, ok := fs.(interface{ StartDirectoryPrefetch(context.Context) }); ok {
 				prefetcher.StartDirectoryPrefetch(ctx)
 			}
@@ -130,6 +112,5 @@ func NewCommand(rt cliruntime.Runtime) *cobra.Command {
 	}
 	rt.WithRuntimeConfigFlag(cmd)
 	cmd.Flags().String("mount-point", "", "local FUSE mount point (defaults to config mount_point)")
-	cmd.Flags().StringP("socket", "s", "", "local debug control socket (start a debug server)")
 	return cmd
 }

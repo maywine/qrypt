@@ -17,7 +17,6 @@ import (
 	"github.com/yinzhenyu/qrypt/pkg/vfs/upload"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/vfstypes"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/view"
-	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -48,30 +47,39 @@ type VFS struct {
 	name          string
 	healthTracker *drive.HealthTracker
 	counters      *drive.Counters
-	rootID        string
-	encrypted     bool
-	testEnabled   bool
+	// stagingCopies/stagingCopyBytes count whole-staging-file copies the write
+	// path had to make because a write could not land in the frozen generation
+	// (a rewrite inside the published prefix, a recorded replacement candidate,
+	// or an unclaimed generation that lost identity). They exist so the copy
+	// cost can be read off the "frozen generation copied" log line instead of
+	// being inferred from a profiler or from timing.
+	stagingCopies    atomic.Uint64
+	stagingCopyBytes atomic.Uint64
+	rootID           string
+	encrypted        bool
+	testEnabled      bool
 
 	// Domain state is grouped by ownership: each runtime is initialized in
 	// New, mutated only by its domain's code paths, and shut down by the VFS
 	// lifecycle. activeDebug (single-state) and pathLocks (cross-domain)
 	// stay top-level.
-	view          *view.View
-	read          *readState
-	reader        *read.Reader
-	uploads       *uploadService
-	uploadTargets *uploadTargetIndex
-	uploadEngine  *upload.Engine
-	deletes       *DeleteService
-	listing       *listingState
-	lister        *listing.Lister
-	hashes        *upload.HashTracker
+	view    *view.View
+	read    *readState
+	reader  *read.Reader
+	uploads *upload.Domain
+	deletes *DeleteService
+	listing *listingState
+	lister  *listing.Lister
 	// activeDebug tracks in-flight debug operations; it is the debug
 	// domain's only top-level state (read history and upload debug live in
 	// their domains).
-	activeDebug   *observe.ActiveStore
-	faults        *faultinject.Registry
-	pathLocks     *pathlock.State
+	activeDebug *observe.ActiveStore
+	faults      *faultinject.Registry
+	pathLocks   *pathlock.State
+	// subtreeMu serializes directory removal (check through view commit)
+	// against mutations that can introduce descendants. Ordinary writes take
+	// a read lock so unrelated file writes remain concurrent.
+	subtreeMu     sync.RWMutex
 	invalidations invalidationState
 
 	// done is closed when the VFS shuts down (Close or context cancel in
@@ -146,7 +154,6 @@ func New(driver drive.Driver, opts Options) (*VFS, error) {
 	overlay, deleteState := view.NewOverlayDelayedDeleteState()
 	vs := view.NewView(opts.RootID, now, overlay)
 	done := make(chan struct{})
-	hashes := upload.NewHashTracker()
 	v := &VFS{
 		driver:        driver,
 		name:          opts.Name,
@@ -158,9 +165,6 @@ func New(driver drive.Driver, opts Options) (*VFS, error) {
 		done:          done,
 		view:          vs,
 		read:          read.NewState(stores.readCacheStore),
-		hashes:        hashes,
-		uploads:       newUploadService(stores.uploadStore, opts, done, hashes),
-		uploadTargets: newUploadTargetIndex(),
 		deletes:       newDeleteService(deleteState, opts.DeleteDelay),
 		listing:       listing.NewState(),
 		activeDebug:   observe.NewActiveStore(opts.Name),
@@ -168,6 +172,7 @@ func New(driver drive.Driver, opts Options) (*VFS, error) {
 		pathLocks:     pathlock.New(),
 		closeDone:     make(chan struct{}),
 	}
+	v.uploads = newUploadDomain(v, stores.uploadStore, opts, done)
 	v.reader = read.NewReader(read.ReaderDeps{
 		Host:     newVFSReadHost(v),
 		State:    v.read,
@@ -181,7 +186,6 @@ func New(driver drive.Driver, opts Options) (*VFS, error) {
 		State:  v.listing,
 		Health: vfsListingHealth{tracker: v.healthTracker},
 	})
-	v.uploadEngine = newUploadEngine(v)
 	return v, nil
 }
 
@@ -275,10 +279,18 @@ func (v *VFS) teardown() {
 	v.lifecycleMu.Lock()
 	switch v.lifecycle {
 	case lifecycleNew:
-		// Never started: only the construction-time read-cache writer needs
-		// closing; nothing to cancel or wait on.
+		// Never started: no workers exist, but operations accepted before
+		// Start may already have armed delayed-delete timers (Remove does not
+		// require a running lifecycle). Stop them so a closed VFS cannot
+		// delete remote content later, then close the construction-time
+		// read-cache writer.
 		v.lifecycle = lifecycleClosed
 		v.lifecycleMu.Unlock()
+		v.uploads.Close()
+		v.deletes.Close()
+		// done is not closed here: no worker or enqueue goroutine can exist
+		// before Start (Flush defers scheduling), and tests use done to model
+		// shutdown directly. Closing it here would double-close that channel.
 		var errs []error
 		if err := v.read.Close(); err != nil {
 			errs = append(errs, err)
@@ -381,32 +393,6 @@ func (v *VFS) CloseReadCache() error {
 	return v.read.Close()
 }
 
-func (v *VFS) Resume(ctx context.Context) {
-	for _, pending := range v.uploads.Store().PendingUploads() {
-		if info, err := os.Stat(pending.LocalPath); err == nil && info.Size() != pending.Size {
-			oldSize := pending.Size
-			pending.Size = info.Size()
-			pending.SourceHashes = nil
-			pending.UpdatedAt = util.Now().UnixNano()
-			if err := v.uploads.Store().SaveUpload(pending); err != nil {
-				logging.L.Warnf("[VFS] repair pending staging size failed op_id=%q path=%q old_size=%d staging_size=%d err=%v", pending.FID, pending.Path, oldSize, pending.Size, err)
-			} else {
-				logging.L.InfofEvery("vfs.repair_pending_staging_size", time.Second, "[VFS] repaired pending staging size op_id=%q path=%q old_size=%d staging_size=%d", pending.FID, pending.Path, oldSize, pending.Size)
-			}
-		}
-		if pending.PermanentFail {
-			logging.L.WarnfEvery("vfs.resume_pending_permanent_failure", time.Second, "[VFS] skip permanently failed upload op_id=%q path=%q name=%q size=%d local=%q retry=%d last_error=%q", pending.FID, pending.Path, pending.Name, pending.Size, pending.LocalPath, pending.RetryCount, pending.LastError)
-			continue
-		}
-		if !pending.Frozen {
-			logging.L.InfofEvery("vfs.resume_pending_mutable", time.Second, "[VFS] keep unflushed pending local; waiting for next flush op_id=%q path=%q name=%q size=%d local=%q", pending.FID, pending.Path, pending.Name, pending.Size, pending.LocalPath)
-			continue
-		}
-		logging.L.InfofEvery("vfs.resume_pending", time.Second, "[VFS] resume pending upload op_id=%q path=%q name=%q size=%d local=%q retry=%d last_error=%q", pending.FID, pending.Path, pending.Name, pending.Size, pending.LocalPath, pending.RetryCount, pending.LastError)
-		v.enqueue(pending)
-	}
-}
-
 func (v *VFS) recordHealthResult(op string, err error) {
 	v.healthTracker.RecordResult(op, err)
 }
@@ -427,7 +413,7 @@ func (v *VFS) invalidateReadCache(entry drive.Entry) {
 }
 
 func (v *VFS) pendingUpload(path string) (PendingUpload, error) {
-	return pendingUploadFromWriteStore(v.uploads.Store(), path)
+	return pendingUploadFromWriteStore(v.uploads, path)
 }
 
 func (v *VFS) lockPath(path string) func() {

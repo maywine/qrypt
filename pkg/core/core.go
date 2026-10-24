@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +34,18 @@ type Options struct {
 	UploadSources  UploadSourceProvider
 	// Bandwidth overrides the config [bandwidth] section when set (CLI flags).
 	Bandwidth *config.BandwidthLimits
+	// DebugListen explicitly selects a debug endpoint for the caller. CLI mount
+	// supplies the built-in local endpoint; Mobile disables automatic startup
+	// and starts its loopback HTTP endpoint explicitly.
+	DebugListen string
+	// DisableDebugAutoStart prevents config-driven debug startup. Mobile uses
+	// this because it owns the explicit loopback debug server lifecycle.
+	DisableDebugAutoStart bool
+	// ControlListen starts the local mutable command server when non-empty.
+	// Control is never enabled implicitly by the debug configuration.
+	ControlListen string
+	// ProbeListen starts the active test/benchmark server when non-empty.
+	ProbeListen string
 }
 
 type UploadSourceProvider interface {
@@ -54,24 +68,52 @@ type Core struct {
 	uploadStreamPollInterval time.Duration
 	debugServer              *control.Server
 	debugToken               string
-	tasks                    *task.Manager
-	uploadSources            UploadSourceProvider
-	readChunkLimit           int
-	vfsCancel                context.CancelFunc
+	controlServer            *control.CommandServer
+	probeServer              *control.Server
+	// tasksMu guards the lazy construction of tasks. Recovery runs inside
+	// newTaskManager and starts runners that read the task back, so a second
+	// concurrent taskManager() call must wait for the first to publish it
+	// instead of building a duplicate manager and store.
+	tasksMu        sync.Mutex
+	tasks          *task.Manager
+	uploadSources  UploadSourceProvider
+	readChunkLimit int
+	vfsCancel      context.CancelFunc
 	// mountContentDedup records, per mount name, whether the mount is
 	// encrypted with content_dedup. Direct uploads only precompute whole-file
 	// source hashes for such mounts; the plaintext SHA-256 is required to
 	// derive the dedup nonce (crypt nonceForSource). Mounts without it skip
 	// the pre-upload full read and let their backend compute any hashes the
 	// protocol needs inline.
-	mountContentDedup map[string]bool
-	streamsMu         sync.Mutex
-	downloadStreams   map[string]*downloadStreamBatch
-	uploadStreams     map[string]*uploadStreamBatch
+	mountContentDedup  map[string]bool
+	uploadDestinations uploadDestinationReservations
+	streamsMu          sync.Mutex
+	downloadStreams    map[string]*downloadStreamBatch
+	uploadStreams      map[string]*uploadStreamBatch
+	// fuseMountPoint is the local mount point the Core's own FUSE tree is
+	// exposed at, when configured. Offline fetch maps a destination inside it
+	// back to the namespace so the write goes through the destination mount
+	// instead of recursing through FUSE.
+	fuseMountPoint string
+	// offlinePollInterval overrides the offline provider observation interval.
+	// Zero means defaultOfflinePollInterval; tests inject a short interval.
+	offlinePollInterval time.Duration
+	// offlineMissingWindow overrides how long a disappeared provider task is
+	// given to re-resolve its destination. Zero means the default.
+	offlineMissingWindow time.Duration
+	// offlineMu guards offlineActive, the task ids whose offline runner is
+	// executing. Recovery and retry consult it to avoid two runners.
+	offlineMu     sync.Mutex
+	offlineActive map[string]struct{}
+	// offlineCreateMu serializes the active de-duplication lookup with the
+	// task submission. Without it two simultaneous matching requests could
+	// both observe "no active task" and create two provider tasks.
+	offlineCreateMu sync.Mutex
 }
 
 type RuntimeLayout struct {
 	RootDir      string
+	RunDir       string
 	ConfigDir    string
 	ReadCacheDir string
 	ThumbnailDir string
@@ -89,6 +131,19 @@ func Open(ctx context.Context, opts Options) (*Core, error) {
 	cfg, err := config.Load(opts.ConfigPath)
 	if err != nil {
 		return nil, err
+	}
+	if opts.Runtime.RunDir == "" {
+		opts.Runtime.RunDir = RuntimeRunDir(opts.ConfigPath, cfg)
+	}
+	return OpenConfig(ctx, cfg, opts)
+}
+
+// OpenConfig opens a Core from an already loaded configuration. Composition
+// roots such as the mount command use this when they have already resolved
+// the config and need the Core to own the complete runtime lifecycle.
+func OpenConfig(ctx context.Context, cfg *config.Config, opts Options) (*Core, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("core: config required")
 	}
 	runtime := NewStorageLayout(cfg, opts.Runtime)
 	if err := ensureRuntimeLayout(runtime); err != nil {
@@ -118,16 +173,37 @@ func Open(ctx context.Context, opts Options) (*Core, error) {
 	if readChunkLimit <= 0 {
 		readChunkLimit = DefaultReadChunkLimit
 	}
-	c := &Core{fs: fs, cleanup: cleanup, configPath: opts.ConfigPath, runtimeLayout: runtime, readCacheDir: runtime.ReadCacheDir, thumbnailDir: runtime.ThumbnailDir, thumbnailMax: thumbnailMax, uploadDir: runtime.UploadDir, defaultUploadMount: cfg.Upload.DefaultMount, defaultUploadPath: cfg.Upload.DefaultPath, uploadSources: opts.UploadSources, readChunkLimit: readChunkLimit, mountContentDedup: contentDedupByMount(cfg), vfsCancel: vfsCancel}
+	c := &Core{fs: fs, cleanup: cleanup, configPath: opts.ConfigPath, runtimeLayout: runtime, readCacheDir: runtime.ReadCacheDir, thumbnailDir: runtime.ThumbnailDir, thumbnailMax: thumbnailMax, uploadDir: runtime.UploadDir, defaultUploadMount: cfg.Upload.DefaultMount, defaultUploadPath: cfg.Upload.DefaultPath, uploadSources: opts.UploadSources, readChunkLimit: readChunkLimit, mountContentDedup: contentDedupByMount(cfg), fuseMountPoint: cfg.EffectiveMountPoint(), vfsCancel: vfsCancel}
 	c.tasks = c.newTaskManager()
 	c.debugToken = cfg.Debug.Token
-	if cfg.Debug.Enabled {
-		if err := c.StartDebugServer(ctx, cfg.Debug.EffectiveListen()); err != nil {
-			// A previous process may still hold the debug socket (e.g. a
-			// sticky service restarted after the app was relaunched). Debug
-			// is a diagnostics-only surface: log and continue with a working
-			// core instead of failing the whole open.
-			logging.L.Warnf("core: debug server on %s failed: %v (continuing without debug server)", cfg.Debug.EffectiveListen(), err)
+	if !opts.DisableDebugAutoStart {
+		debugListen := opts.DebugListen
+		if debugListen == "" && cfg.Debug.Enabled {
+			debugListen = cfg.Debug.Listen
+			if debugListen == "" {
+				debugListen = DebugSocketPath(cfg, runtime)
+			}
+		}
+		if debugListen != "" {
+			if err := c.StartDebugServer(ctx, debugListen); err != nil {
+				// A previous process may still hold the debug socket (e.g. a
+				// sticky service restarted after the app was relaunched). Debug
+				// is a diagnostics-only surface: log and continue with a working
+				// core instead of failing the whole open.
+				logging.L.Warnf("core: debug server on %s failed: %v (continuing without debug server)", debugListen, err)
+			}
+		}
+	}
+	if opts.ControlListen != "" {
+		if err := c.StartControlServer(ctx, opts.ControlListen); err != nil {
+			_ = c.Close(context.Background())
+			return nil, err
+		}
+	}
+	if opts.ProbeListen != "" {
+		if err := c.StartProbeServer(ctx, opts.ProbeListen); err != nil {
+			_ = c.Close(context.Background())
+			return nil, err
 		}
 	}
 	return c, nil
@@ -249,12 +325,27 @@ func (c *Core) Close(ctx context.Context) error {
 		return nil
 	}
 	var errs []error
+	// Stop accepting new debug/control requests before tearing down the
+	// filesystem and task manager. This prevents a late local request from
+	// racing with the resources it observes or mutates.
+	if err := c.StopControlServer(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	if err := c.StopDebugServer(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	if err := c.StopProbeServer(ctx); err != nil {
+		errs = append(errs, err)
+	}
 	// The task manager owns long-running goroutines (stream pollers, batch
 	// runners) whose contexts derive from the manager, not from any
 	// caller-passed context; close it even when no cleanup is registered
 	// (directly constructed cores used by tests).
-	if c.tasks != nil {
-		c.tasks.Close()
+	c.tasksMu.Lock()
+	tasks := c.tasks
+	c.tasksMu.Unlock()
+	if tasks != nil {
+		tasks.Close()
 	}
 	// Stop the VFS workers even if the caller's context is still alive
 	// (e.g. a background context from the mobile session layer).
@@ -277,15 +368,10 @@ func (c *Core) Close(ctx context.Context) error {
 			return errors.Join(append(errs, err)...)
 		}
 	}
-	if c.cleanup == nil {
-		c.fs = nil
-		return errors.Join(errs...)
+	if c.cleanup != nil {
+		c.cleanup()
+		c.cleanup = nil
 	}
-	if err := c.StopDebugServer(ctx); err != nil {
-		errs = append(errs, err)
-	}
-	c.cleanup()
-	c.cleanup = nil
 	c.fs = nil
 	return errors.Join(errs...)
 }
@@ -376,6 +462,46 @@ func DefaultCacheDir() string {
 	return filepath.Join(qryptHomeDir(), "cache")
 }
 
+func DefaultRunDir() string {
+	return filepath.Join(qryptHomeDir(), "run")
+}
+
+// DebugSocketPath returns the built-in local debug endpoint for a runtime.
+func DebugSocketPath(cfg *config.Config, runtime RuntimeLayout) string {
+	return runtimeEndpoint(NewStorageLayout(cfg, runtime).RunDir, "debug")
+}
+
+func ControlSocketPath(cfg *config.Config, runtime RuntimeLayout) string {
+	return runtimeEndpoint(NewStorageLayout(cfg, runtime).RunDir, "control")
+}
+
+func ProbeSocketPath(cfg *config.Config, runtime RuntimeLayout) string {
+	return runtimeEndpoint(NewStorageLayout(cfg, runtime).RunDir, "probe")
+}
+
+// RuntimeRunDir returns the per-configuration runtime directory used for
+// built-in local endpoints. Explicit storage roots and QRYPT_HOME retain their
+// existing process-wide isolation semantics; otherwise separate config files
+// get separate run directories under the writable application runtime base
+// (~/.qrypt/run). The config file's own directory is never used: qrypt must
+// work with a read-only config such as /etc/qrypt.toml.
+func RuntimeRunDir(configPath string, cfg *config.Config) string {
+	if home := strings.TrimSpace(os.Getenv("QRYPT_HOME")); home != "" {
+		return filepath.Join(filepath.Clean(util.ExpandHome(home)), "run")
+	}
+	if cfg != nil && strings.TrimSpace(cfg.Storage.WorkDir) != "" {
+		return filepath.Join(util.ExpandHome(cfg.Storage.WorkDir), "run")
+	}
+	if strings.TrimSpace(configPath) != "" {
+		absolute, err := filepath.Abs(util.ExpandHome(configPath))
+		if err == nil {
+			key := sha256.Sum256([]byte(absolute))
+			return filepath.Join(DefaultRunDir(), hex.EncodeToString(key[:6]))
+		}
+	}
+	return DefaultRunDir()
+}
+
 func DefaultUploadDir() string {
 	return filepath.Join(qryptHomeDir(), "upload")
 }
@@ -437,6 +563,7 @@ func NewStorageLayout(cfg *config.Config, runtime RuntimeLayout) RuntimeLayout {
 	}
 	layout := RuntimeLayout{
 		RootDir:      workDir,
+		RunDir:       filepath.Join(workDir, "run"),
 		ReadCacheDir: readCacheDir,
 		ThumbnailDir: thumbnailDir,
 		UploadDir:    uploadDir,
@@ -451,6 +578,9 @@ func NewStorageLayout(cfg *config.Config, runtime RuntimeLayout) RuntimeLayout {
 func mergeRuntimeLayout(base, override RuntimeLayout) RuntimeLayout {
 	if override.RootDir != "" {
 		base.RootDir = util.ExpandHome(override.RootDir)
+	}
+	if override.RunDir != "" {
+		base.RunDir = util.ExpandHome(override.RunDir)
 	}
 	if override.ConfigDir != "" {
 		base.ConfigDir = util.ExpandHome(override.ConfigDir)
@@ -482,7 +612,7 @@ func mergeRuntimeLayout(base, override RuntimeLayout) RuntimeLayout {
 }
 
 func ensureRuntimeLayout(layout RuntimeLayout) error {
-	for _, dir := range []string{layout.ConfigDir, layout.ReadCacheDir, layout.ThumbnailDir, layout.UploadDir, layout.StateDir, layout.DriverDir, layout.LogDir, layout.TmpDir} {
+	for _, dir := range []string{layout.ConfigDir, layout.RunDir, layout.ReadCacheDir, layout.ThumbnailDir, layout.UploadDir, layout.StateDir, layout.DriverDir, layout.LogDir, layout.TmpDir} {
 		if dir == "" {
 			continue
 		}

@@ -601,8 +601,22 @@ func (d *Driver) uploadPart(ctx context.Context, pre *upPreResp, partNumber int,
 		etag := resp.Header.Get("Etag")
 		resp.Body.Close()
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			logging.L.DebugfEvery("quark.upload_part.done", time.Second, "[QUARK] upload part done task=%q part=%d bytes=%d auth=%s oss=%s", pre.Data.TaskID, partNumber, length, authDur, ossDur)
-			return etag, nil
+			if etag != "" {
+				logging.L.DebugfEvery("quark.upload_part.done", time.Second, "[QUARK] upload part done task=%q part=%d bytes=%d auth=%s oss=%s", pre.Data.TaskID, partNumber, length, authDur, ossDur)
+				return etag, nil
+			}
+			// A multipart part without an ETag cannot be completed: the ETag
+			// goes into the completion body, so accepting this response would
+			// persist a resume record that can never finish the upload.
+			if attempt < ossMaxRetries {
+				logging.L.WarnfEvery("quark.upload_part_no_etag_retry", time.Second, "[QUARK] upload part returned no ETag; retry task=%q part=%d attempt=%d", pre.Data.TaskID, partNumber, attempt+1)
+				if err := sleepContext(ctx, ossRetryDelay(attempt)); err != nil {
+					return "", err
+				}
+				continue
+			}
+			logging.L.Warnf("[QUARK] upload part has no ETag task=%q part=%d attempts=%d", pre.Data.TaskID, partNumber, attempt+1)
+			return "", fmt.Errorf("upload part %d: response carried no ETag", partNumber)
 		}
 		if attempt < ossMaxRetries {
 			logging.L.WarnfEvery("quark.upload_part_status_retry", time.Second, "[QUARK] upload part status retry task=%q part=%d attempt=%d status=%d", pre.Data.TaskID, partNumber, attempt+1, resp.StatusCode)
@@ -671,6 +685,19 @@ func ossRetryDelay(attempt int) time.Duration {
 	return util.ExponentialBackoffWithOptions(attempt, ossRetryBaseDelay, 2*time.Minute, false)
 }
 
+// APIError is a provider business-code failure. It keeps the numeric code so
+// an offline caller can classify a listing failure (auth, quota, ...) instead
+// of treating every failure as transient.
+type APIError struct {
+	Status  int
+	Code    int
+	Message string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("quark: api error: status=%d code=%d msg=%s", e.Status, e.Code, e.Message)
+}
+
 func apiError(resp respEnvelope) error {
 	if resp.Status < 400 && resp.Code == 0 {
 		return nil
@@ -683,7 +710,7 @@ func apiError(resp respEnvelope) error {
 	case 23008:
 		return fmt.Errorf("quark: directory already exists")
 	}
-	return fmt.Errorf("quark: api error: status=%d code=%d msg=%s", resp.Status, resp.Code, resp.Message)
+	return &APIError{Status: resp.Status, Code: resp.Code, Message: resp.Message}
 }
 
 type traceReadCloser struct {

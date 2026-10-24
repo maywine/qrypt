@@ -17,6 +17,8 @@ func NewLoginCmd(rt LoginRuntime) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:       "login PROVIDER",
 		Short:     "Scan a web login QR code and save credentials to a mount",
+		Long:      "Scan the provider's QR code and confirm login, then save the credentials to the selected mount in the config file.",
+		Example:   "  qrypt driver login quark\n  qrypt driver login quark --mount cloud --config ./qrypt.toml",
 		Args:      cliruntime.ExactNamedArgs(rt, "PROVIDER"),
 		ValidArgs: []string{"quark"},
 		RunE: func(cmd *cobra.Command, args []string) error {

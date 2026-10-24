@@ -6,7 +6,6 @@ import (
 	"github.com/yinzhenyu/qrypt/pkg/drive"
 	"github.com/yinzhenyu/qrypt/pkg/logging"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/faultinject"
-	"github.com/yinzhenyu/qrypt/pkg/vfs/pathlock"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/upload"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/vfstypes"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/view"
@@ -18,25 +17,26 @@ import (
 // Upload domain shell on VFS: type aliases into pkg/vfs/upload, the
 // service/engine assembly, and the VFS upload methods (scheduling,
 // snapshotting, staging read-cache seeds, worker loop).
-type uploadService = upload.Service
 type uploadStore = upload.PendingStore
 type uploadTaskRecord = upload.UploadTaskRecord
 type uploadSnapshot = upload.UploadSnapshot
 type uploadAdmission = upload.Admission
-type uploadTargetIndex = upload.TargetIndex
 
-func newUploadTargetIndex() *uploadTargetIndex {
-	return upload.NewTargetIndex(upload.DefaultTargetIndexTTL)
-}
-
-// newUploadService builds the upload service wired to VFS state.
-func newUploadService(store *uploadStore, opts Options, done chan struct{}, hashes *upload.HashTracker) *uploadService {
-	return upload.NewService(upload.ServiceOptions{
-		UploadDelay:   opts.UploadDelay,
-		UploadWorkers: opts.UploadWorkers,
-		Store:         store,
-		Done:          done,
-		HashOps:       hashes,
+func newUploadDomain(v *VFS, store *uploadStore, opts Options, done chan struct{}) *upload.Domain {
+	return upload.NewDomain(upload.DomainOptions{
+		Store:                 store,
+		UploadDelay:           opts.UploadDelay,
+		UploadWorkers:         opts.UploadWorkers,
+		Done:                  done,
+		Remote:                newVFSDriverRuntime(v.driver, v.testEnabled).RemoteMutationBackend(),
+		View:                  newVFSViewCommitter(v),
+		Invalidations:         vfsUploadInvalidations{invalidations: &v.invalidations},
+		Snapshot:              newVFSUploadSnapshotter(v),
+		Faults:                newVFSUploadFaultController(v.faults),
+		ModTimeFor:            view.NewRuntime(v.view).LocalModTimeFor,
+		SchedulingEnabled:     v.uploadSchedulingEnabled,
+		SourceUploadSupported: drive.HasCapability(v.driver, drive.CapabilitySourceUploader),
+		HealthResult:          v.healthTracker.RecordResult,
 	})
 }
 
@@ -48,9 +48,16 @@ func (v *VFS) PendingUploads() []PendingUpload {
 	return v.uploads.PendingUploads()
 }
 
-// VFS wrapper methods delegating to uploadService. These exist for
-// backward compatibility with internal callers; the upload schedule
-// implementation lives in internal/upload.
+// DiscardUpload removes the pending upload state for path without touching the
+// remote entry. A failed transfer uses it so an incomplete staging generation
+// is not recovered and published later.
+func (v *VFS) DiscardUpload(path string) error {
+	path = vfstypes.CleanVirtualPath(path)
+	return v.uploads.Discard(path)
+}
+
+// VFS wrapper methods delegate scheduling to the upload domain while keeping
+// lifecycle policy in VFS.
 
 func (v *VFS) enqueue(p PendingUpload) {
 	if v.uploadSchedulingEnabled() {
@@ -74,20 +81,6 @@ func (v *VFS) uploadSchedulingEnabled() bool {
 }
 
 // newUploadEngine builds the upload engine wired to VFS adapters.
-func newUploadEngine(v *VFS) *upload.Engine {
-	return upload.NewEngine(upload.EngineDeps{
-		Remote:        newVFSDriverRuntime(v.driver, v.testEnabled).RemoteMutationBackend(),
-		Targets:       v.uploadTargets,
-		Observer:      newVFSUploadObserver(v.uploads, v.healthTracker),
-		Pending:       upload.NewStoreAdapter(v.uploads.Store()),
-		Runtime:       newVFSUploadRuntime(v),
-		View:          newVFSViewCommitter(v),
-		Invalidations: vfsUploadInvalidations{invalidations: &v.invalidations},
-		Snapshot:      newVFSUploadSnapshotter(v),
-		Faults:        newVFSUploadFaultController(v.faults),
-	})
-}
-
 type vfsUploadInvalidations struct {
 	invalidations *invalidationState
 }
@@ -100,45 +93,29 @@ type vfsUploadFaultController struct {
 
 // --- upload_runtime.go ---
 
-type vfsUploadRuntime struct {
-	hashes            *upload.HashTracker
-	uploads           *uploadService
-	viewRT            view.Runtime
-	schedulingEnabled func() bool
-}
-
-// the upload time.
-func (r vfsUploadRuntime) ModTimeFor(path string) time.Time {
-	return r.viewRT.LocalModTimeFor(path)
-}
-
-type vfsUploadObserver struct {
-	svc     *uploadService
-	tracker *drive.HealthTracker
-}
-
 // --- upload_snapshot.go ---
 
 type vfsUploadSnapshotter struct {
-	locks           *pathlock.State
-	store           *uploadStore
-	hashes          *upload.HashTracker
-	driver          drive.Driver
 	snapshotPending func(PendingUpload) (upload.Snapshot, error)
 }
 
 func (v *VFS) snapshotPending(pending PendingUpload) (upload.Snapshot, error) {
 	unlock := v.lockPath(pending.Path)
 	defer unlock()
-	if err := v.uploads.Store().SyncStaging(pending.LocalPath); err != nil {
+	if err := v.uploads.SyncStaging(pending.LocalPath); err != nil {
 		return upload.Snapshot{}, err
 	}
 	info, err := os.Stat(pending.LocalPath)
 	if err != nil {
 		return upload.Snapshot{}, err
 	}
-	if info.Size() != pending.Size {
-		return upload.Snapshot{}, fmt.Errorf("vfs: pending changed during upload snapshot: file has %d, expected %d", info.Size(), pending.Size)
+	// A frozen generation may have grown by appends after it was claimed. The
+	// upload source is bound to (path, pending.Size), so the prefix this
+	// snapshot describes is unaffected by bytes past that size; a shrink is
+	// not acceptable, because the recorded size and hashes would describe
+	// content that is no longer there.
+	if info.Size() < pending.Size {
+		return upload.Snapshot{}, fmt.Errorf("vfs: pending staging shrank during upload snapshot: file has %d, expected %d", info.Size(), pending.Size)
 	}
 	algorithms := requiredUploadSnapshotHashes(v.driver)
 	if sourceHashesCover(pending.SourceHashes, algorithms) {
@@ -147,7 +124,7 @@ func (v *VFS) snapshotPending(pending PendingUpload) (upload.Snapshot, error) {
 			Hashes: cloneSourceHashes(pending.SourceHashes),
 		}, nil
 	}
-	if hashes, ok := v.hashes.Snapshot(pending, algorithms); ok {
+	if hashes, ok := v.uploads.SnapshotHashes(pending, algorithms); ok {
 		return upload.Snapshot{
 			Path:        pending.LocalPath,
 			Hashes:      hashes,
@@ -163,7 +140,10 @@ func (v *VFS) snapshotPending(pending PendingUpload) (upload.Snapshot, error) {
 	if err != nil {
 		return upload.Snapshot{}, err
 	}
-	if _, err := io.Copy(io.MultiWriter(writers...), src); err != nil {
+	// Bound the fallback read to the snapshot size: a frozen generation can
+	// have grown by appends since it was claimed, and hashing past the claimed
+	// size would describe a prefix the upload does not publish.
+	if _, err := io.CopyN(io.MultiWriter(writers...), src, pending.Size); err != nil {
 		return upload.Snapshot{}, err
 	}
 	sums := make(drive.SourceHashes, len(hashes))
@@ -252,12 +232,11 @@ func (v *VFS) seedReadCacheFromSource(ctx context.Context, entry drive.Entry, so
 // --- upload_worker.go ---
 
 func (v *VFS) uploadWorker(ctx context.Context) {
-	runtime := newVFSUploadWorkerRuntime(v)
 	for {
-		pending, ok := runtime.Receive(ctx)
+		pending, ok := v.uploads.Receive(ctx)
 		if !ok {
-			runtime.StopUploadTimers()
-			runtime.StopDeleteTimers()
+			v.uploads.Close()
+			v.deletes.Close()
 			return
 		}
 		_ = v.uploadPending(ctx, pending)
@@ -266,36 +245,14 @@ func (v *VFS) uploadWorker(ctx context.Context) {
 }
 
 func (v *VFS) uploadPending(ctx context.Context, pending PendingUpload) error {
-	return upload.PendingWithRuntime(ctx, pending, newVFSUploadWorkerRuntime(v), v.uploads.WorkerCount(), v.uploads.DefaultDelay())
+	return v.uploads.ProcessPending(ctx, pending)
 }
 
-// vfsUploadWorkerRuntime adapts VFS internals to upload.WorkerRuntime.
-type vfsUploadWorkerRuntime struct {
-	uploads           *uploadService
-	deletes           *DeleteService
-	driver            drive.Driver
-	done              chan struct{}
-	schedulingEnabled func() bool
-	engine            *upload.Engine
-}
-
-// enqueueBlocking delivers a pending to the worker queue, blocking until it
-// is accepted or the VFS shuts down; reports whether it was delivered.
-func (r vfsUploadWorkerRuntime) enqueueBlocking(pending PendingUpload) bool {
-	select {
-	case r.uploads.Queue() <- pending:
-		return true
-	case <-r.done:
-		return false
-	}
-}
-
-// Compile-time check that the adapter satisfies upload.WorkerRuntime.
-var _ upload.WorkerRuntime = (*vfsUploadWorkerRuntime)(nil)
-
-func pendingUploadFromWriteStore(store *uploadStore, path string) (PendingUpload, error) {
+func pendingUploadFromWriteStore(store interface {
+	PendingByPath(string) (PendingUpload, bool)
+}, path string) (PendingUpload, error) {
 	path = vfstypes.CleanVirtualPath(path)
-	pending, ok := store.UploadByPath(path)
+	pending, ok := store.PendingByPath(path)
 	if !ok {
 		return PendingUpload{}, fmt.Errorf("vfs: no pending file for %s", path)
 	}
@@ -303,8 +260,8 @@ func pendingUploadFromWriteStore(store *uploadStore, path string) (PendingUpload
 }
 
 type vfsUploadWriteHashTracker struct {
-	hashes *upload.HashTracker
-	driver drive.Driver
+	uploads *upload.Domain
+	driver  drive.Driver
 }
 
 type vfsUploadWriteRemote struct {

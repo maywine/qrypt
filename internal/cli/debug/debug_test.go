@@ -2,8 +2,11 @@ package debug
 
 import (
 	"context"
+	"encoding/json"
+	"github.com/yinzhenyu/qrypt/internal/cli/i18n"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -51,9 +54,22 @@ func (debugReportTestSource) DebugSnapshot() diagnostics.DebugSnapshot {
 	}
 }
 
+// debugTestEndpoint returns a control endpoint the current platform can serve:
+// a unix socket path on unix, a named pipe name on Windows, whose transport
+// rejects unix endpoints.
+func debugTestEndpoint(t *testing.T) string {
+	t.Helper()
+	token := strconv.FormatInt(time.Now().UnixNano(), 10)
+	if runtime.GOOS == "windows" {
+		return `pipe:\\.\pipe\qrypt-test-` + token
+	}
+	path := filepath.Join(os.TempDir(), "qrypt-test-"+token+".sock")
+	t.Cleanup(func() { _ = os.Remove(path) })
+	return path
+}
+
 func TestDebugCollectOmitsTransferContextWithoutSource(t *testing.T) {
-	socketPath := filepath.Join(os.TempDir(), "qrypt-test-"+strconv.FormatInt(time.Now().UnixNano(), 10)+".sock")
-	defer os.Remove(socketPath)
+	socketPath := debugTestEndpoint(t)
 	server, err := control.NewServer(socketPath, debugReportTestSource{})
 	if err != nil {
 		t.Fatal(err)
@@ -235,5 +251,28 @@ func TestValidateDriverBenchRequest(t *testing.T) {
 	}
 	if err := ValidateDriverBenchRequest(contracttest.DriverTestRequest{Test: "xfer", Source: "src", Dest: "dst", Samples: 1}); err != nil {
 		t.Fatalf("expected xfer benchmark request to be valid: %v", err)
+	}
+}
+
+func TestBundleWrittenMessageLocalized(t *testing.T) {
+	if got := bundleWrittenMessage(i18n.New(i18n.LangEN), "x.zip"); got != "Wrote debug bundle to x.zip" {
+		t.Fatalf("English message = %q", got)
+	}
+	if got := bundleWrittenMessage(i18n.New(i18n.LangZHCN), "x.zip"); got != "已写入调试包：x.zip" {
+		t.Fatalf("Chinese message = %q", got)
+	}
+}
+
+func TestDebugReportJSONStaysEnglish(t *testing.T) {
+	report := NewDebugAIReport(context.Background(), "debug collect", "/cloud/a")
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, key := range []string{`"schema_version"`, `"generated_at"`, `"command"`, `"path"`} {
+		if !strings.Contains(text, key) {
+			t.Errorf("debug JSON missing English key %s: %s", key, text)
+		}
 	}
 }

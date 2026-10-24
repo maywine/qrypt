@@ -3,22 +3,28 @@ package control
 import (
 	"context"
 	"crypto/subtle"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/yinzhenyu/qrypt/pkg/logging"
 	"github.com/yinzhenyu/qrypt/pkg/task"
-	"github.com/yinzhenyu/qrypt/pkg/util"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/diagnostics"
 )
 
 const APIVersion = "v1"
+
+// controlShutdownGrace bounds the background drain that Close starts. The
+// initiating caller may return as soon as its own context expires, but the
+// drain itself must still finish so no goroutine or listener outlives the
+// server.
+const controlShutdownGrace = 5 * time.Second
 
 type Snapshotter interface {
 	DebugSnapshot() diagnostics.DebugSnapshot
@@ -54,10 +60,14 @@ type Server struct {
 	listener   net.Listener
 	stop       context.CancelFunc
 	authToken  string
+	cancelBase context.CancelFunc
+	mutable    bool
+	closeOnce  sync.Once
+	closeDone  chan struct{}
+	closeErr   error
 }
 
-// SetAuthToken configures TCP authentication before Start. Unix sockets use
-// filesystem permissions and do not require a token.
+// SetAuthToken configures TCP authentication before Start. Local endpoints use OS permissions.
 func (s *Server) SetAuthToken(token string) {
 	s.authToken = token
 }
@@ -115,7 +125,7 @@ func (s *Server) Start(ctx context.Context) error {
 			return err
 		}
 	}
-	listener, err := net.Listen(s.network, s.address)
+	listener, err := listenEndpointNetwork(s.network, s.address)
 	if err != nil {
 		return err
 	}
@@ -128,7 +138,12 @@ func (s *Server) Start(ctx context.Context) error {
 	s.listener = listener
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", s.handleHealth)
-	mux.HandleFunc("/v1/debug/reset", s.handleDebugReset)
+	if s.mutable {
+		mux.HandleFunc("/v1/debug/reset", s.handleDebugReset)
+		mux.HandleFunc("/v1/bench", s.handleBench)
+		mux.HandleFunc("/v1/driver/test", s.handleDriverTest)
+		mux.HandleFunc("/v1/debug/faults/upload-cancel", s.handleDebugUploadCancelFaults)
+	}
 	mux.HandleFunc("/v1/state", s.handleState)
 	mux.HandleFunc("/v1/pending", s.handlePending)
 	mux.HandleFunc("/v1/tasks", s.handleTasks)
@@ -136,9 +151,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/v1/uploads", s.handleUploads)
 	mux.HandleFunc("/v1/ops", s.handleOps)
 	mux.HandleFunc("/v1/reads", s.handleReads)
-	mux.HandleFunc("/v1/bench", s.handleBench)
 	mux.HandleFunc("/v1/driver", s.handleDriver)
-	mux.HandleFunc("/v1/driver/test", s.handleDriverTest)
 	mux.HandleFunc("/v1/mounts/health", s.handleMountHealth)
 	mux.HandleFunc("/v1/events", s.handleEvents)
 	mux.HandleFunc("/v1/list", s.handleList)
@@ -147,7 +160,6 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/v1/cache", s.handleCache)
 	mux.HandleFunc("/v1/read-memory", s.handleReadMemory)
 	mux.HandleFunc("/v1/staging", s.handleStaging)
-	mux.HandleFunc("/v1/debug/faults/upload-cancel", s.handleDebugUploadCancelFaults)
 	mux.HandleFunc("/v1/consistency", s.handleConsistency)
 	mux.HandleFunc("/v1/runtime", s.handleRuntime)
 	mux.HandleFunc("/v1/upload-memory", s.handleUploadMemory)
@@ -157,7 +169,18 @@ func (s *Server) Start(ctx context.Context) error {
 	if s.network == "tcp" {
 		handler = s.authenticate(mux)
 	}
-	s.server = &http.Server{Handler: handler}
+	// BaseContext is cancelled by Close so long-poll handlers (task events,
+	// offline wait) observe shutdown even while http.Server.Shutdown is still
+	// waiting for them.
+	baseCtx, cancelBase := context.WithCancel(context.Background())
+	s.cancelBase = cancelBase
+	s.server = &http.Server{
+		Handler: handler,
+		BaseContext: func(net.Listener) context.Context {
+			return baseCtx
+		},
+	}
+	s.closeDone = make(chan struct{})
 	// Derive our own context so the goroutine below exits on Close even when
 	// the caller passed a background context (context.Background().Done() is
 	// nil, which would block the <-ctx.Done() receive forever).
@@ -215,34 +238,6 @@ func removeStaleSocket(path string) error {
 	return os.Remove(path)
 }
 
-func listenEndpoint(endpoint string) (network, address string, err error) {
-	endpoint = strings.TrimSpace(endpoint)
-	switch {
-	case endpoint == "":
-		return "", "", fmt.Errorf("control: listen endpoint required")
-	case strings.HasPrefix(endpoint, "unix:"):
-		path := strings.TrimPrefix(endpoint, "unix:")
-		if path == "" {
-			return "", "", fmt.Errorf("control: unix listen path required")
-		}
-		return "unix", util.ExpandHome(path), nil
-	case strings.HasPrefix(endpoint, "tcp:"):
-		return tcpListenEndpoint(strings.TrimPrefix(endpoint, "tcp:"))
-	case strings.HasPrefix(endpoint, "http://"):
-		parsed, err := url.Parse(endpoint)
-		if err != nil {
-			return "", "", err
-		}
-		return tcpListenEndpoint(parsed.Host)
-	case strings.HasPrefix(endpoint, "https://"):
-		return "", "", fmt.Errorf("control: https listen is not supported")
-	}
-	if _, port, err := net.SplitHostPort(endpoint); err == nil && isNumericPort(port) {
-		return tcpListenEndpoint(endpoint)
-	}
-	return "unix", util.ExpandHome(endpoint), nil
-}
-
 // isNumericPort reports whether port is a bare decimal port number. A bare
 // endpoint is treated as TCP only when its port is numeric; on Windows a
 // unix socket path like "C:\...\qrypt.sock" also splits as host:port, so it
@@ -259,43 +254,68 @@ func isNumericPort(port string) bool {
 	return true
 }
 
-func tcpListenEndpoint(address string) (string, string, error) {
-	if address == "" {
-		return "", "", fmt.Errorf("control: tcp listen address required")
+// Close stops the server. Exactly one drain runs; every caller waits for that
+// drain or for its own context, whichever happens first, so a caller with a
+// deadline is never held hostage by another caller's blocking shutdown.
+func (s *Server) Close(ctx context.Context) error {
+	if s == nil || s.closeDone == nil {
+		return nil
 	}
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		return "", "", err
+	s.closeOnce.Do(func() {
+		// Notify the ctx.Done goroutine started by Start so it cannot leak even
+		// if the original Start context was background.
+		if s.stop != nil {
+			s.stop()
+		}
+		// Cancel handler contexts first: long-poll requests must stop waiting
+		// before Shutdown can drain them.
+		if s.cancelBase != nil {
+			s.cancelBase()
+		}
+		go s.shutdown()
+	})
+	select {
+	case <-s.closeDone:
+		return s.closeErr
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	if host == "" {
-		return "", "", fmt.Errorf("control: tcp debug listen must bind to loopback, got %q", address)
-	}
-	ip := net.ParseIP(host)
-	if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
-		return "", "", fmt.Errorf("control: tcp debug listen must bind to loopback, got %q", address)
-	}
-	return "tcp", address, nil
 }
 
-func (s *Server) Close(ctx context.Context) error {
-	// Notify the ctx.Done goroutine started by Start so it cannot leak even
-	// if the original Start context was background.
-	if s.stop != nil {
-		s.stop()
-	}
+// shutdown drains connections and releases the listener. It always terminates
+// because the graceful phase is bounded and a timed-out drain forces the
+// remaining connections closed.
+func (s *Server) shutdown() {
+	defer close(s.closeDone)
+	var errs []error
 	if s.server != nil {
-		_ = s.server.Shutdown(ctx)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), controlShutdownGrace)
+		err := s.server.Shutdown(shutdownCtx)
+		cancel()
+		if err != nil {
+			errs = append(errs, err)
+			if closeErr := s.server.Close(); closeErr != nil && !errors.Is(closeErr, http.ErrServerClosed) {
+				errs = append(errs, closeErr)
+			}
+		}
 	}
 	if s.listener != nil {
-		_ = s.listener.Close()
+		if err := s.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
 	}
 	if s.socketPath != "" {
-		_ = os.Remove(s.socketPath)
+		if err := os.Remove(s.socketPath); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
 	}
-	return nil
+	s.closeErr = errors.Join(errs...)
 }
 
 func (s *Server) SocketPath() string {
+	if s.network == "pipe" {
+		return "pipe:" + s.address
+	}
 	return s.socketPath
 }
 

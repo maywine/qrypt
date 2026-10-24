@@ -8,12 +8,37 @@
   2. `~/.qrypt/qrypt.toml`
   3. Unix：`$XDG_CONFIG_HOME/qrypt/qrypt.toml`，默认 `~/.config/qrypt/qrypt.toml`
   4. Windows：`%AppData%\qrypt\qrypt.toml`
+- 界面语言按 `--lang` → `QRYPT_LANG` → 系统 locale → 英文的顺序选择，支持 `en` 和 `zh-CN`。帮助、内置命令以及 `fs`/`offline` 的人类可读输出会随语言切换；`--json` 输出、诊断报告、表格头、状态/类型等稳定代码、错误信息和日志保持英文。需要稳定英文输出时设置 `QRYPT_LANG=en` 或传入 `--lang en`；脚本解析结构化结果时应使用 `--json`。
 - `REMOTE` 表示 qrypt 虚拟文件系统路径；`LOCAL` 表示本机路径。
 - `fs get` 的 `LOCAL` 为 `-` 时写入标准输出。
 - `fs put` 的 `LOCAL` 为 `-` 时读取标准输入。
 - 支持 `--json` 的查询命令会向标准输出写入稳定的 JSON，状态提示和错误写入标准错误。
 - 命令不再在每次执行时打印所用配置文件路径；需要确认时用 `qrypt config path`。
 - 路径参数中的 `~` 会被展开为用户主目录。
+
+### 帮助与发现
+
+帮助是分层的，每一层都给出下一步可执行的命令：
+
+- **出错时**：用法错误（拼错的 flag、缺少参数、拼错的子命令）会以一条可复制的下一步命令结尾（`Next:` 段）；子命令名接近时会给出 `Did you mean this?` 建议。
+- **组概览**：不带子命令运行一个命令组（如 `qrypt fs`、`qrypt offline`）会打印该组的帮助与示例，而不是报错。
+- **命令帮助**：每个命令都有摘要、使用场景说明和可复制示例；`--advanced` 展开进阶 flag：
+
+  ```sh
+  qrypt offline fetch --help --advanced
+  ```
+
+  进阶 flag 默认不出现在帮助里，但仍可正常使用。
+- **机器可读**：`qrypt schema [COMMAND]` 以 JSON 输出子命令、参数与 flag，供脚本、编辑器、GUI 使用，无需解析渲染后的帮助文本：
+
+  ```sh
+  qrypt schema offline fetch
+  ```
+- **补全**：内置 shell 补全脚本。
+
+  ```sh
+  qrypt completion bash   # 也支持 zsh、fish
+  ```
 
 ### 退出码
 
@@ -71,10 +96,12 @@ printf '%s' "$PASSWORD" | qrypt config export-rclone-password --password-stdin
 ## 挂载
 
 ```sh
-qrypt mount [MOUNT_NAME] [--config PATH] [--mount-point PATH] [--socket PATH]
+qrypt mount [MOUNT_NAME] [--config PATH] [--mount-point PATH]
 ```
 
-省略 `MOUNT_NAME` 时挂载配置中的全部云盘；指定 `MOUNT_NAME` 时只挂载该云盘，根目录就是该云盘内容。省略 `--mount-point` 时读取配置中的 `[mount].mount_point`。`--socket` 启动本机调试接口。
+省略 `MOUNT_NAME` 时挂载配置中的全部云盘；指定 `MOUNT_NAME` 时只挂载该云盘，根目录就是该云盘内容。省略 `--mount-point` 时读取配置中的 `[mount].mount_point`。运行时 socket 使用配置目录下的内置路径，无需手工指定。
+
+`Ctrl+C`、`SIGTERM`、关闭终端或断开 SSH（`SIGHUP`）都会触发优雅卸载。如果上一次挂载进程被强行结束，qrypt 会在下次挂载时自动识别并清理残留挂载点；仍失败时参见[挂载点残留](troubleshooting.md#挂载点残留)。
 
 ## 文件系统操作
 
@@ -110,7 +137,7 @@ qrypt fs list / --config PATH
 
 `list` 支持 `--jsonl`（JSON Lines）：每行输出一个条目的 JSON，适合大目录流式消费（`jq -s` 可聚合）；`--json` 与 `--jsonl` 互斥。`list --human` 以 K/M/G/T 显示大小。`find` 递归查找名字包含 `NAME`（大小写不敏感）的条目，`--json` 输出匹配条目列表。
 
-`check A B` 比较两个目录树（`A`/`B` 可为 `/MOUNT/...` 虚拟路径或本机路径，至少一端是虚拟路径）：逐文件比对大小与修改时间（`--hash` 或 `--compare=hash` 时再比内容哈希），输出缺失/多余/不一致清单，`--json` 输出结构化结果。退出码 0 一致、4 有差异。文件与目录类型不一致会报告 `type` 差异。加密挂载透明处理：本地明文目录可直接与加密挂载比对；`--hash` 需要网盘提供内容哈希（已支持：阿里云盘 sha1、115 sha1、百度网盘 md5、OneDrive sha1；加密挂载下本地会使用远端 nonce 重算密文哈希，全程不下载文件正文），加密挂载下本地会使用远端 nonce 重算密文哈希，全程不下载文件正文。`--compare=mtime-only` 只按修改时间判定差异（忽略大小差异，内容变了但大小与 mtime 都没变会被当作一致）。`du` 统计目录树文件数与总字节数；`df` 显示所配置驱动的空间（默认逐 mount 列出；`MOUNT` 参数或 `--mount` 只看单个）。两者默认人类可读大小，`--bytes` 输出原始字节，`--json` 输出数字。`rm`/`mv` 支持 `--json` 输出结构化结果。
+`check A B` 比较两个目录树（`A`/`B` 可为 `/MOUNT/...` 虚拟路径或本机路径，至少一端是虚拟路径）：逐文件比对大小与修改时间（`--hash` 或 `--compare=hash` 时再比内容哈希），输出缺失/多余/不一致清单，`--json` 输出结构化结果。退出码 0 一致、4 有差异。文件与目录类型不一致会报告 `type` 差异。加密挂载透明处理：本地明文目录可直接与加密挂载比对；`--hash` 需要网盘提供内容哈希（已支持：阿里云盘 sha1、115 sha1、百度网盘 md5、OneDrive sha1；加密挂载下本地会使用远端 nonce 重算密文哈希，全程不下载文件正文）。`--compare=mtime-only` 只按修改时间判定差异（忽略大小差异，内容变了但大小与 mtime 都没变会被当作一致）。`du` 统计目录树文件数与总字节数；`df` 显示所配置驱动的空间（默认逐 mount 列出；`MOUNT` 参数或 `--mount` 只看单个）。两者默认人类可读大小，`--bytes` 输出原始字节，`--json` 输出数字。`rm`/`mv` 支持 `--json` 输出结构化结果。
 
 `sync SOURCE DESTINATION` 单向同步：让 `DESTINATION` 匹配 `SOURCE`（`SOURCE` 权威，至少一端是虚拟路径）。默认只新增缺失文件、更新变化文件（大小，`--hash` 时含内容哈希），**不删除** `DESTINATION` 多余文件；`--delete` 才删除。`--compare` 选择比较策略：`size-mtime`（默认）、`mtime-only`（只看修改时间，忽略大小差异）、`hash`（等价 `--hash`）。`sync` 默认对支持后端内容哈希的网盘（阿里云盘 sha1、115 sha1、百度网盘 md5、OneDrive sha1）自动启用哈希比对，能检测同大小内容变化；无后端哈希的网盘（如夸克）自动降级为大小比对。注意：`mtime-only` 在无法保留 mtime 的网盘（如夸克，只记录上传时间）上会每次全量重传——只有明确知道目标端 mtime 可靠时才使用。上传会把源文件 mtime 传播给目标端；若目标网盘无法保留 mtime（如夸克，只记录上传时间），则 mtime 差异不触发内容重传（按 size/hash 判定），避免每次同步全量重传。文件/目录类型冲突默认不覆盖（报告 `conflict`，退出码 3），可用 `--conflict=skip` 跳过或 `--conflict=source` 让源端胜出。`--dry-run` 只输出计划不产生任何写入（退出码 0）；`--json` 输出结构化计划/结果（含 add/update/delete/skip/conflict/failed 汇总与按路径排序的条目）。同步执行顺序保证先建目录再传文件、先删子项再删目录；单个文件失败不中断其余文件，存在失败时退出码 3。同步会等待所有上传完成后才返回（不设超时，慢网盘不会误报失败）；Ctrl-C 可中断，中断后会话保留，用 `--resume` 继续。`--resume` 继续上次中断/部分失败的会话：只重试未完成和失败的文件，不重新扫描两棵树。会话计划保存在工作目录的 `sync/` 子目录（默认 `~/.qrypt/sync/`，同一对源/目标共享一个会话目录），全部完成后自动清除，中断遗留的会话 7 天未动会在下次同步时自动清理；`--dry-run` 不写任何会话。
 
@@ -125,8 +152,6 @@ qrypt fs --bwlimit 10M --bwlimit-upload 2M copy SRC DST
 
 `--bwlimit SIZE` 同时限制下载与上传；`--bwlimit-download` / `--bwlimit-upload` 单独限制一个方向，可与 `--bwlimit` 组合（细粒度 flag 优先）。
 
-`fs` 命令组支持 `--config PATH`，既可写在子命令前，也可写在子命令后：
-
 `crypt-encode` / `crypt-decode` 用指定 mount 的 `[mounts.encryption]` 配置对文件名逐段加解密，用于对照网盘后端存储的密文文件名和本地明文路径：
 
 ```sh
@@ -135,6 +160,37 @@ qrypt fs crypt-decode [MOUNT] "b4l6g..."     # 密文 → 明文（反查本地�
 ```
 
 `MOUNT` 省略时使用第一个配置了加密的 mount。加密方向与挂载时 VFS 对后端文件名使用的算法一致（同一 password/salt/编码，可逐段处理多级路径）。未加密的 mount 会报错。
+
+## 离线下载
+
+`offline` 命令组通过本机控制 socket 把远程资源交给网盘侧的离线下载服务，并在同一个任务模型里观察、控制和拉取结果。需要运行中的 `qrypt mount`，当前支持该能力的驱动为 `quark`。
+
+```sh
+qrypt offline add SOURCE [--parse-to /MOUNT/DIR | --mount NAME] [--mkdir]
+                       [--select all|largest[:N]] [--include GLOB] [--exclude GLOB]
+                       [--name TITLE] [--new] [--idempotency-key KEY] [--wait] [--json]
+qrypt offline fetch SOURCE [--parse-to /MOUNT/DIR | --mount NAME] --download-to PATH
+                         [--wait] [--flat] [--keep-cloud] [--mkdir]
+                         [--workers N] [--chunk-size SIZE]
+                         [--select ...] [--include GLOB] [--exclude GLOB]
+                         [--name TITLE] [--new] [--idempotency-key KEY] [--json]
+qrypt offline inspect SOURCE [--parse-to /MOUNT/DIR | --mount NAME] [--select ...] [--json]
+qrypt offline list [--all] [--state STATE] [--mount NAME] [--limit N] [--json]
+qrypt offline show TASK_ID [--json]
+qrypt offline cancel TASK_ID
+qrypt offline retry TASK_ID
+qrypt offline wait TASK_ID [--timeout DURATION] [--json]
+```
+
+常用流程：
+
+```sh
+qrypt offline add magnet:?xt=urn:btih:... --parse-to /quark/downloads
+qrypt offline wait <task-id>
+qrypt fs get /quark/downloads/<file> ./<file>
+```
+
+来源格式、目的地规则、两阶段 fetch、并发参数和错误码见[离线下载](offline-download.md)。
 
 ## 驱动信息
 
@@ -152,62 +208,32 @@ Cookie 写入权限为 `0600` 的配置文件，不输出到终端。二维码�
 
 ## 调试
 
-运行时调试命令使用 `--socket PATH`、`--url URL` 或配置中的
-`[debug].listen` 连接运行中的 debug server。`collect`、`watch` 和
-`bundle` 还需要说明要检查哪个挂载：平时请用 `--mount NAME`；确实需要
-检查全部挂载时，再用 `--all-mounts`。
+调试命令通过运行目录中的内置 debug socket 连接运行中的 debug server。Unix-like 系统使用 socket 文件，Windows 使用 named pipe。
+
+需要显式使用本机 TCP 时，配置 `debug.listen = "127.0.0.1:19090"` 和至少 32 字符的随机 `debug.token`。CLI 从同一配置读取地址和 token，也可用 `--url http://127.0.0.1:19090` 指定地址、`--token-file PATH` 从私有文件读取 token。TCP 只允许回环地址，拒绝浏览器 Origin 请求；默认的本地 socket／named pipe 不需要 token。`debug.listen` 只影响只读诊断，`probe` 和任务控制仍使用各自的本地端点。
 
 ```sh
-qrypt debug collect [REMOTE] [--dest DESTINATION] --socket PATH --mount NAME
-qrypt debug collect [REMOTE] [--dest DESTINATION] --url http://127.0.0.1:19090 --mount NAME
-qrypt debug watch [REMOTE] [--jsonl] --socket PATH --mount NAME
-qrypt debug test TEST --socket PATH
-qrypt debug raw ENDPOINT --socket PATH
-qrypt debug bundle [REMOTE] [--dest DESTINATION] --socket PATH --mount NAME --out FILE [--force]
+qrypt debug collect [REMOTE] [--dest DESTINATION] --mount NAME
+qrypt debug watch [REMOTE] [--jsonl] --mount NAME
+qrypt debug raw ENDPOINT
+qrypt debug bundle [REMOTE] [--dest DESTINATION] --mount NAME --out FILE [--force]
+
+qrypt probe test TEST [probe flags]
+qrypt probe bench TEST [benchmark flags]
 ```
 
-也可以在配置中启用 HTTP 调试入口：
+`collect`、`watch` 和 `bundle` 需要用 `--mount NAME` 指定挂载；`--mount` 可重复传入，确需检查全部挂载时使用 `--all-mounts`。`debug watch --jsonl` 适合管道式消费。
 
-```toml
-[debug]
-enabled = true
-listen = "127.0.0.1:19090"
-token = "<填入 openssl rand -hex 32 生成的随机值>"
-```
+`probe test` / `probe bench` 只使用配置中设置了 `test_enabled = true` 的挂载。测试项、输出含义和完整调试流程见[调试文档](../for-developer/debug.md)。
 
-TCP 必须配置至少 32 字符的随机 `token`，否则拒绝启动。配置文件应仅当前用户可读（Unix 上使用 `chmod 600 qrypt.toml`）。CLI 自动读取同一配置中的 token；也可以用 `--token-file PATH` 指定只包含 token 的私有文件，覆盖配置值。token 不接受 URL 查询参数传递，也不要放入命令行参数或分享的诊断包。
-
-TCP 仅监听回环地址，拒绝非回环 Host 及带 Origin 的浏览器请求；HTTP 客户端须发送 `Authorization: Bearer <token>`。`--socket PATH` 使用权限为 `0600` 的 Unix socket，无需 token。
-
-启用后，debug 命令可以省略 `--url`：
+任务控制：
 
 ```sh
-qrypt debug collect --mount NAME
+qrypt control task cancel TASK_ID
+qrypt control task retry TASK_ID
 ```
 
-`--mount` 可以重复传入多个挂载名。`--all-mounts` 会收集全部挂载，输出可能更大，请只在需要整体排查时使用。
-
-`debug watch --jsonl` 会逐行输出每个采样样本的 JSON（而非单个汇总报告），适合管道式消费：`qrypt debug watch --jsonl ... | jq -c '.uploads[]'`。
-
-跨挂载传输问题应同时提供源路径和 `--dest`；报告会分别收集两端路径状态、读取/上传历史和挂载能力。
-
-driver 和 VFS 测试通过 `debug test` 显式执行，`TEST` 可为 `auth`、`batchupload`、`batchmove`、`crud`、`instantupload`、`multipart`、`fs`、`read`、`resume` 或 `xfer`。这些测试只会使用在 `[[mounts]]` 中设置了 `test_enabled = true` 的挂载；`xfer` 要求 source 和 dest 都启用。`auth` 是只读认证探测，其他测试可能创建临时远端对象。`fs` 会检查 VFS 写入、上传、读取和清理流程；`read` 从实际 FUSE 挂载目录读取自动生成的远端文件，报告冷/热缓存的首包延迟、持续与峰值速度、读取调用延迟和缓存命中情况；使用 `mount-debug-test.sh` 时临时挂载目录会自动传入。`batchupload` 会在同一父目录批量写入小文件，并检查目录解析缓存是否复用；`batchmove` 会先等待这些文件上传完成，再通过 VFS `Rename` 将它们从源目录逐个移动到目标目录。两个批量测试都支持 `--count`（默认 50，最大 100）和 `--size`（默认 4 KiB，最大 1 MiB）。`resume` 会故意取消一次上传，用来确认断点续传或重试恢复是否正常。`multipart` 会上传一个 34 MiB 的伪随机文件（可用 `--size` 调整）并逐字节读回校验，覆盖分片/块上传路径——普通 CRUD 测试的小文件不会触达这部分。注意读回校验受网盘下载速度影响：在限速的网盘上（如 115 非会员，约 100 KB/s）34 MiB 全量读回可能耗时数分钟，建议先跑小 `--size` 验证或按需调整。所有测试都会使用带随机后缀的临时目录并在结束时清理。
-
-离线 journal 检查使用 `fs journal`，可传配置文件或明确的缓存目录。
-
-```sh
-qrypt fs journal [--config PATH | --cache-dir PATH] [--json]
-qrypt fs journal replay [--config PATH | --cache-dir PATH] [--json]
-qrypt fs journal prune [--config PATH | --cache-dir PATH] [--json]
-```
-
-- `fs journal` 检查离线上传队列：dirty/clean 条目、失败条目、staging 孤儿文件等。
-- `fs journal replay` 重置失败条目的失败状态（清掉 permanent failure、重试计数和错误），下次挂载时自动重试；不要求挂载在线，可直接操作 journal 目录。
-- `fs journal prune` 删除 staging 数据已丢失或大小不匹配的条目（这些条目已无法上传），并压缩 journal 文件。
-
-常用组合：先 `prune` 清掉数据已丢失的条目，再 `replay` 重置剩余失败条目，最后挂载重试。
-
-详细说明见[调试文档](../for-developer/debug.md)。
+上传队列异常时使用 `fs journal`，说明见[上传队列](troubleshooting.md#上传队列)。
 
 ## 版本与补全
 
@@ -219,3 +245,31 @@ qrypt completion zsh
 qrypt completion fish
 qrypt completion powershell
 ```
+
+## 升级
+
+```sh
+qrypt upgrade
+qrypt upgrade --check
+qrypt upgrade --to <版本>   # 进阶：安装指定版本（可降级）
+qrypt upgrade --force       # 进阶：当前不是发行版时仍继续
+```
+
+`qrypt upgrade` 拉取当前平台最新的正式 release，校验 `qrypt_<版本>_checksums.txt` 中的 sha256，校验通过后原子替换正在运行的可执行文件。文件先下载到临时目录，校验成功前不会改动现有二进制，因此下载失败或校验不匹配都会保留当前版本。
+
+- `--check` 只报告当前版本与最新版本，不下载也不写入。
+- `--to <版本>` 安装指定 release（例如 `v0.5.5`），可与当前版本相同或更旧。
+- `--force` 在无法比较的构建（如 `v0.5.5-10-g9d16c54` 这类 `git describe` 版本）下仍继续；默认会拒绝。
+- `--json` 输出单个 JSON 结果（含当前版本、目标版本与结果状态），进度信息写入标准错误。
+
+替换的是当前运行的可执行文件本身，指向它的符号链接保持有效。可执行文件不可写时，命令不会自行提权，而是打印需要以相应权限重跑的命令（Unix 上形如 `sudo <路径> upgrade`）。
+
+### 卸载
+
+```sh
+qrypt uninstall
+qrypt uninstall --yes
+qrypt uninstall --purge --yes   # 进阶：连同 ~/.qrypt 下的数据一起删除
+```
+
+`qrypt uninstall` 卸载安装脚本创建的 qrypt，并移除安装脚本写入的 `PATH` 配置。默认**保留**你的 qrypt 数据（配置、缓存、日志、会话）；加 `--purge` 才会一并删除。默认会先确认，`--yes` 跳过确认；没有可删除内容时命令成功返回并提示 `nothing to remove`。

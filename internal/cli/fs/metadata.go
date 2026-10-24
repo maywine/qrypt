@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/yinzhenyu/qrypt/internal/cli/i18n"
 	cliruntime "github.com/yinzhenyu/qrypt/internal/cli/runtime"
 )
 
@@ -12,6 +13,8 @@ func NewStatCmd(rt cliruntime.Runtime) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:               "stat REMOTE",
 		Short:             "Show path metadata",
+		Long:              `Show the size, type, and modification time of REMOTE.`,
+		Example:           `  qrypt fs stat /cloud/photos/cat.jpg`,
 		Args:              cliruntime.ExactNamedArgs(rt, "REMOTE"),
 		RunE:              runStat(rt),
 		ValidArgsFunction: cliruntime.NoFileCompletions,
@@ -36,7 +39,7 @@ func runStat(rt cliruntime.Runtime) func(*cobra.Command, []string) error {
 		if asJSON {
 			return cliruntime.WritePrettyJSON(cmd.OutOrStdout(), entry)
 		}
-		cliruntime.PrintEntryStat(cmd.OutOrStdout(), entry)
+		cliruntime.PrintEntryStat(cmd.OutOrStdout(), i18n.FromCommand(cmd), entry)
 		return nil
 	}
 }
@@ -45,6 +48,8 @@ func NewMkdirCmd(rt cliruntime.Runtime) *cobra.Command {
 	return &cobra.Command{
 		Use:               "mkdir REMOTE",
 		Short:             "Create a directory",
+		Long:              `Create the directory REMOTE.`,
+		Example:           `  qrypt fs mkdir /cloud/photos/2026`,
 		Args:              cliruntime.ExactNamedArgs(rt, "REMOTE"),
 		RunE:              runMkdir(rt),
 		ValidArgsFunction: cliruntime.NoFileCompletions,
@@ -68,6 +73,8 @@ func NewRmCmd(rt cliruntime.Runtime) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:               "rm REMOTE",
 		Short:             "Remove a file or empty directory",
+		Long:              `Remove the file or empty directory REMOTE, waiting for the deletion to reach the backend.`,
+		Example:           `  qrypt fs rm /cloud/docs/old-report.pdf`,
 		Args:              cliruntime.ExactNamedArgs(rt, "REMOTE"),
 		RunE:              runRm(rt),
 		ValidArgsFunction: cliruntime.NoFileCompletions,
@@ -115,7 +122,7 @@ func runRm(rt cliruntime.Runtime) func(*cobra.Command, []string) error {
 				Removed bool   `json:"removed"`
 			}{Path: args[0], Removed: true})
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "removed %s\n", args[0])
+		fmt.Fprintln(cmd.OutOrStdout(), i18n.FromCommand(cmd).T("out.fs.rm.removed", args[0]))
 		return nil
 	}
 }
@@ -124,6 +131,8 @@ func NewMvCmd(rt cliruntime.Runtime) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:               "mv SOURCE DESTINATION",
 		Short:             "Rename or move a path",
+		Long:              `Rename or move SOURCE to DESTINATION.`,
+		Example:           `  qrypt fs mv /cloud/docs/draft.pdf /cloud/docs/final.pdf`,
 		Args:              cliruntime.ExactNamedArgs(rt, "SOURCE", "DESTINATION"),
 		RunE:              runMv(rt),
 		ValidArgsFunction: cliruntime.NoFileCompletions,
@@ -150,7 +159,7 @@ func runMv(rt cliruntime.Runtime) func(*cobra.Command, []string) error {
 				Renamed     bool   `json:"renamed"`
 			}{Source: args[0], Destination: args[1], Renamed: true})
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "renamed %s -> %s\n", args[0], args[1])
+		fmt.Fprintln(cmd.OutOrStdout(), i18n.FromCommand(cmd).T("out.fs.mv.renamed", args[0], args[1]))
 		return nil
 	}
 }

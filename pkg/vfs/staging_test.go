@@ -8,12 +8,14 @@ import (
 	"crypto/sha256"
 	"errors"
 	"github.com/yinzhenyu/qrypt/pkg/drive"
+	"github.com/yinzhenyu/qrypt/pkg/drivers/localfs"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/pathlock"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/read"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/upload"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/view"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -21,6 +23,88 @@ import (
 func newTestViewState(rootID string, now time.Time) *view.View {
 	overlay, _ := view.NewOverlayDelayedDeleteState()
 	return view.NewView(rootID, now, overlay)
+}
+
+// failListDriver wraps a real driver and can fail List on demand, simulating
+// a transient listing/network error during the write path.
+type failListDriver struct {
+	*localfs.Driver
+	mu   sync.Mutex
+	fail bool
+}
+
+func (d *failListDriver) List(ctx context.Context, parentID string) ([]drive.Entry, error) {
+	d.mu.Lock()
+	fail := d.fail
+	d.mu.Unlock()
+	if fail {
+		return nil, errors.New("transient list failure")
+	}
+	return d.Driver.List(ctx, parentID)
+}
+
+func (d *failListDriver) setFail(fail bool) {
+	d.mu.Lock()
+	d.fail = fail
+	d.mu.Unlock()
+}
+
+// TestWriteAndTruncateDoNotTreatResolveErrorsAsAbsence pins the write-path
+// error class: only a definitive NotFound may initialize an empty staging
+// file. A transient List error must fail the operation and leave the remote
+// content untouched.
+func TestWriteAndTruncateDoNotTreatResolveErrorsAsAbsence(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	remote := t.TempDir()
+	if err := os.WriteFile(filepath.Join(remote, "data.txt"), []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	drv := &failListDriver{Driver: localfs.New(remote)}
+	fs, err := New(drv, Options{StorageDir: t.TempDir(), CacheMaxBytes: 10 << 20, UploadDelay: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	drv.setFail(true)
+	if _, err := fs.WriteAt(ctx, "/data.txt", []byte("XY"), 2); err == nil {
+		t.Fatal("WriteAt succeeded despite a List failure")
+	}
+	if pending := fs.PendingUploads(); len(pending) != 0 {
+		t.Fatalf("pending = %+v, want none after failed write", pending)
+	}
+	if err := fs.Truncate(ctx, "/data.txt", 0); err == nil {
+		t.Fatal("Truncate succeeded despite a List failure")
+	}
+	drv.setFail(false)
+	data, err := os.ReadFile(filepath.Join(remote, "data.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "abcdef" {
+		t.Fatalf("remote content after failed writes = %q, want the original", data)
+	}
+}
+
+func TestWriteToDirectoryRejected(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	remote := t.TempDir()
+	if err := os.Mkdir(filepath.Join(remote, "dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fs, err := New(localfs.New(remote), Options{StorageDir: t.TempDir(), CacheMaxBytes: 10 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.WriteAt(ctx, "/dir", []byte("x"), 0); !errors.Is(err, ErrIsDir) {
+		t.Fatalf("WriteAt directory err = %v, want ErrIsDir", err)
+	}
+	if err := fs.Truncate(ctx, "/dir", 0); !errors.Is(err, ErrIsDir) {
+		t.Fatalf("Truncate directory err = %v, want ErrIsDir", err)
+	}
+	if pending := fs.PendingUploads(); len(pending) != 0 {
+		t.Fatalf("pending = %+v, want none", pending)
+	}
 }
 
 func TestRotateFrozenGenerationCopiesContent(t *testing.T) {
@@ -42,7 +126,7 @@ func TestRotateFrozenGenerationCopiesContent(t *testing.T) {
 	}
 	v := &VFS{
 		read:      read.NewState(cache.readCacheStore),
-		uploads:   newUploadService(cache.uploadStore, Options{}, nil, upload.NewHashTracker()),
+		uploads:   upload.NewDomain(upload.DomainOptions{Store: cache.uploadStore}),
 		pathLocks: pathlock.New(),
 		view:      newTestViewState("0", time.Now()),
 	}
@@ -83,7 +167,7 @@ func TestRotateFrozenGenerationFailureKeepsOldPending(t *testing.T) {
 	}
 	v := &VFS{
 		read:      read.NewState(cache.readCacheStore),
-		uploads:   newUploadService(cache.uploadStore, Options{}, nil, upload.NewHashTracker()),
+		uploads:   upload.NewDomain(upload.DomainOptions{Store: cache.uploadStore}),
 		pathLocks: pathlock.New(),
 		view:      newTestViewState("0", time.Now()),
 	}
@@ -128,7 +212,7 @@ func TestCreateReplacingMutablePendingRemovesOldStaging(t *testing.T) {
 	if err := fs.Create(ctx, "/file"); err != nil {
 		t.Fatal(err)
 	}
-	old, ok := fs.uploads.Store().UploadByPath("/file")
+	old, ok := fs.uploads.PendingByPath("/file")
 	if !ok {
 		t.Fatal("old pending missing")
 	}
@@ -142,7 +226,7 @@ func TestCreateReplacingMutablePendingRemovesOldStaging(t *testing.T) {
 	if _, err := os.Stat(oldLocal); !os.IsNotExist(err) {
 		t.Fatalf("old mutable staging still exists, err=%v", err)
 	}
-	latest, ok := fs.uploads.Store().UploadByPath("/file")
+	latest, ok := fs.uploads.PendingByPath("/file")
 	if !ok {
 		t.Fatal("new pending missing")
 	}
@@ -170,7 +254,7 @@ func TestCreateReplacingFrozenPendingKeepsOldStaging(t *testing.T) {
 	if err := fs.Flush(ctx, "/file"); err != nil {
 		t.Fatal(err)
 	}
-	old, ok := fs.uploads.Store().UploadByPath("/file")
+	old, ok := fs.uploads.PendingByPath("/file")
 	if !ok {
 		t.Fatal("old pending missing")
 	}
@@ -183,7 +267,7 @@ func TestCreateReplacingFrozenPendingKeepsOldStaging(t *testing.T) {
 	if _, err := os.Stat(old.LocalPath); err != nil {
 		t.Fatalf("old frozen staging removed: %v", err)
 	}
-	latest, ok := fs.uploads.Store().UploadByPath("/file")
+	latest, ok := fs.uploads.PendingByPath("/file")
 	if !ok {
 		t.Fatal("new pending missing")
 	}
@@ -241,7 +325,7 @@ func TestFlushSurfacesStagingSyncFailure(t *testing.T) {
 	if _, err := fs.WriteAt(ctx, "/gone.bin", []byte("data"), 0); err != nil {
 		t.Fatal(err)
 	}
-	before, ok := fs.uploads.Store().UploadByPath("/gone.bin")
+	before, ok := fs.uploads.PendingByPath("/gone.bin")
 	if !ok {
 		t.Fatal("pending record missing after write")
 	}
@@ -253,7 +337,7 @@ func TestFlushSurfacesStagingSyncFailure(t *testing.T) {
 	if err == nil || !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("Flush error = %v, want a missing-staging error", err)
 	}
-	after, ok := fs.uploads.Store().UploadByPath("/gone.bin")
+	after, ok := fs.uploads.PendingByPath("/gone.bin")
 	if !ok {
 		t.Fatal("pending record dropped by a failed flush")
 	}
@@ -279,7 +363,7 @@ func TestFlushZeroByteStaging(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pending, ok := fs.uploads.Store().UploadByPath("/empty.bin")
+	pending, ok := fs.uploads.PendingByPath("/empty.bin")
 	if !ok {
 		t.Fatal("pending record missing after flush")
 	}
@@ -303,7 +387,7 @@ func TestSnapshotPendingReturnsStagingPathDirectly(t *testing.T) {
 	}
 	v := &VFS{
 		read:      read.NewState(cache.readCacheStore),
-		uploads:   newUploadService(cache.uploadStore, Options{}, nil, upload.NewHashTracker()),
+		uploads:   upload.NewDomain(upload.DomainOptions{Store: cache.uploadStore}),
 		pathLocks: pathlock.New(),
 		view:      newTestViewState("0", time.Now()),
 	}
@@ -355,7 +439,7 @@ func TestSnapshotPendingComputesDriverRequiredHashes(t *testing.T) {
 	v := &VFS{
 		driver:    drv,
 		read:      read.NewState(cache.readCacheStore),
-		uploads:   newUploadService(cache.uploadStore, Options{}, nil, upload.NewHashTracker()),
+		uploads:   upload.NewDomain(upload.DomainOptions{Store: cache.uploadStore}),
 		pathLocks: pathlock.New(),
 		view:      newTestViewState("0", time.Now()),
 	}
@@ -401,7 +485,7 @@ func TestSnapshotPendingUsesPersistedHashesAfterRestart(t *testing.T) {
 	v := &VFS{
 		driver:    &snapshotHashDriver{Driver: drive.NewFakeDriver(), hashes: []drive.HashAlgorithm{drive.HashMD5, drive.HashSHA1}},
 		read:      read.NewState(cache.readCacheStore),
-		uploads:   newUploadService(cache.uploadStore, Options{}, nil, upload.NewHashTracker()),
+		uploads:   upload.NewDomain(upload.DomainOptions{Store: cache.uploadStore}),
 		pathLocks: pathlock.New(),
 		view:      newTestViewState("0", time.Now()),
 	}
@@ -539,7 +623,7 @@ func (d *snapshotHashDriver) RequiredUploadHashes() []drive.HashAlgorithm {
 func TestPendingQuietWindowUsesLargeFileMinimum(t *testing.T) {
 	t.Parallel()
 	store, _ := newUploadStore(t.TempDir(), "test-mount")
-	v := &VFS{uploads: newUploadService(store, Options{UploadDelay: 10 * time.Millisecond}, nil, upload.NewHashTracker())}
+	v := &VFS{uploads: upload.NewDomain(upload.DomainOptions{Store: store, UploadDelay: 10 * time.Millisecond})}
 
 	small := v.uploads.QuietWindow(PendingUpload{Size: upload.LargeUploadQuietThreshold - 1})
 	if small != 10*time.Millisecond {

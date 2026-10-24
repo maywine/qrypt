@@ -9,8 +9,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-
-	"github.com/yinzhenyu/qrypt/pkg/util"
 )
 
 type Client struct {
@@ -28,24 +26,31 @@ func NewClient(socketPath string) (*Client, error) {
 	if socketPath == "" {
 		return nil, fmt.Errorf("control: socket path required")
 	}
-	if baseURL, ok := clientHTTPBaseURL(socketPath); ok {
+	parsed, err := parseEndpoint(socketPath)
+	if err != nil {
+		return nil, err
+	}
+	if baseURL, ok := clientHTTPBaseURL(socketPath, parsed); ok {
 		return &Client{
-			baseURL: baseURL,
+			socketPath: baseURL,
+			baseURL:    baseURL,
 			httpClient: &http.Client{
 				// Never forward debug credentials to a redirected endpoint.
 				CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 			},
 		}, nil
 	}
-	socketPath = util.ExpandHome(socketPath)
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			var dialer net.Dialer
-			return dialer.DialContext(ctx, "unix", socketPath)
+			return dialEndpoint(ctx, socketPath)
 		},
 	}
+	clientEndpoint := parsed.address
+	if parsed.network == "pipe" {
+		clientEndpoint = "pipe:" + parsed.address
+	}
 	return &Client{
-		socketPath: socketPath,
+		socketPath: clientEndpoint,
 		httpClient: &http.Client{
 			Transport: transport,
 		},
@@ -73,6 +78,19 @@ func (c *Client) PostJSON(ctx context.Context, path string, value any) ([]byte, 
 	return c.do(req, path)
 }
 
+// TransportError is a non-2xx control response. It preserves the response
+// status and body so a caller (the CLI) can classify the server's failure,
+// while Error() keeps the historical message shape.
+type TransportError struct {
+	Path   string
+	Status int
+	Body   string
+}
+
+func (e *TransportError) Error() string {
+	return fmt.Sprintf("control: %s returned status %d: %s", e.Path, e.Status, e.Body)
+}
+
 func (c *Client) do(req *http.Request, path string) ([]byte, error) {
 	if c.baseURL != "" && c.authToken != "" {
 		req.Header.Set("Authorization", "Bearer "+c.authToken)
@@ -87,7 +105,7 @@ func (c *Client) do(req *http.Request, path string) ([]byte, error) {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("control: %s returned status %d: %s", path, resp.StatusCode, string(body))
+		return nil, &TransportError{Path: path, Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
 	return body, nil
 }
@@ -103,16 +121,16 @@ func (c *Client) url(path string) string {
 	return "http://qrypt" + path
 }
 
-func clientHTTPBaseURL(endpoint string) (string, bool) {
+func clientHTTPBaseURL(endpoint string, parsed endpointInfo) (string, bool) {
 	endpoint = strings.TrimSpace(endpoint)
+	if parsed.network != "tcp" {
+		return "", false
+	}
 	switch {
-	case strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://"):
+	case strings.HasPrefix(endpoint, "http://"):
 		return endpoint, true
 	case strings.HasPrefix(endpoint, "tcp:"):
-		return "http://" + strings.TrimPrefix(endpoint, "tcp:"), true
+		return "http://" + parsed.address, true
 	}
-	if _, port, err := net.SplitHostPort(endpoint); err == nil && isNumericPort(port) {
-		return "http://" + endpoint, true
-	}
-	return "", false
+	return "http://" + parsed.address, true
 }

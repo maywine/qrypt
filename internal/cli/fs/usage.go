@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
+	"github.com/yinzhenyu/qrypt/internal/cli/i18n"
 	cliruntime "github.com/yinzhenyu/qrypt/internal/cli/runtime"
 	"github.com/yinzhenyu/qrypt/pkg/drive"
 	syncer "github.com/yinzhenyu/qrypt/pkg/syncer"
@@ -21,8 +22,11 @@ type SpaceEntry struct {
 
 func NewDfCmd(rt cliruntime.Runtime) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:               "df [MOUNT]",
-		Short:             "Show space usage of the configured drives",
+		Use:   "df [MOUNT]",
+		Short: "Show space usage of the configured drives",
+		Long:  `Show total, free, and used space for the configured drives, or for one MOUNT when given.`,
+		Example: `  qrypt fs df
+  qrypt fs df cloud --bytes`,
 		Args:              cliruntime.MaxArgs(rt, 1),
 		RunE:              runDf(rt),
 		ValidArgsFunction: cliruntime.NoFileCompletions,
@@ -42,6 +46,7 @@ func runDf(rt cliruntime.Runtime) func(*cobra.Command, []string) error {
 
 		asJSON, _ := cmd.Flags().GetBool("json")
 		asBytes, _ := cmd.Flags().GetBool("bytes")
+		loc := i18n.FromCommand(cmd)
 		printBytes := cliruntime.FormatBytes
 		if asBytes {
 			printBytes = func(n int64) string { return fmt.Sprintf("%d", n) }
@@ -75,7 +80,7 @@ func runDf(rt cliruntime.Runtime) func(*cobra.Command, []string) error {
 						if asJSON {
 							return cliruntime.WritePrettyJSON(cmd.OutOrStdout(), entry)
 						}
-						fmt.Fprintf(cmd.OutOrStdout(), "%s: total %s, free %s, used %s\n", entry.Name, printBytes(entry.Total), printBytes(entry.Free), printBytes(entry.Used))
+						fmt.Fprintln(cmd.OutOrStdout(), loc.T("out.fs.df.mount", entry.Name, printBytes(entry.Total), printBytes(entry.Free), printBytes(entry.Used)))
 						return nil
 					}
 				}
@@ -104,7 +109,7 @@ func runDf(rt cliruntime.Runtime) func(*cobra.Command, []string) error {
 					continue
 				}
 				entry, _ := entryFrom(mount.Name, mount.Space, nil)
-				fmt.Fprintf(cmd.OutOrStdout(), "%s: total %s, free %s, used %s\n", entry.Name, printBytes(entry.Total), printBytes(entry.Free), printBytes(entry.Used))
+				fmt.Fprintln(cmd.OutOrStdout(), loc.T("out.fs.df.mount", entry.Name, printBytes(entry.Total), printBytes(entry.Free), printBytes(entry.Used)))
 			}
 			return nil
 		}
@@ -124,7 +129,7 @@ func runDf(rt cliruntime.Runtime) func(*cobra.Command, []string) error {
 		if asJSON {
 			return cliruntime.WritePrettyJSON(cmd.OutOrStdout(), entry)
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "total: %s, free: %s, used: %s\n", printBytes(entry.Total), printBytes(entry.Free), printBytes(entry.Used))
+		fmt.Fprintln(cmd.OutOrStdout(), loc.T("out.fs.df.total", printBytes(entry.Total), printBytes(entry.Free), printBytes(entry.Used)))
 		return nil
 	}
 }
@@ -138,8 +143,11 @@ type DiskUsageResult struct {
 
 func NewDuCmd(rt cliruntime.Runtime) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:               "du [REMOTE]",
-		Short:             "Show disk usage of a directory tree",
+		Use:   "du [REMOTE]",
+		Short: "Show disk usage of a directory tree",
+		Long:  `Show the file count and total bytes of the tree at REMOTE, or of the namespace root when REMOTE is omitted.`,
+		Example: `  qrypt fs du /cloud/photos
+  qrypt fs du /cloud/photos --bytes`,
 		Args:              cliruntime.MaxArgs(rt, 1),
 		RunE:              runDu(rt),
 		ValidArgsFunction: cliruntime.NoFileCompletions,
@@ -151,6 +159,7 @@ func NewDuCmd(rt cliruntime.Runtime) *cobra.Command {
 
 func runDu(rt cliruntime.Runtime) func(*cobra.Command, []string) error {
 	return func(cmd *cobra.Command, args []string) error {
+		loc := i18n.FromCommand(cmd)
 		path := "/"
 		if len(args) > 0 {
 			path = args[0]
@@ -188,10 +197,10 @@ func runDu(rt cliruntime.Runtime) func(*cobra.Command, []string) error {
 		}
 		asBytes, _ := cmd.Flags().GetBool("bytes")
 		if asBytes {
-			fmt.Fprintf(cmd.OutOrStdout(), "%d files, %d bytes\n", files, bytes)
+			fmt.Fprintln(cmd.OutOrStdout(), loc.T("out.fs.du.files_bytes", files, bytes))
 			return nil
 		}
-		fmt.Fprintf(cmd.OutOrStdout(), "%d files, %s\n", files, cliruntime.FormatBytes(bytes))
+		fmt.Fprintln(cmd.OutOrStdout(), loc.T("out.fs.du.files_human", files, cliruntime.FormatBytes(bytes)))
 		return nil
 	}
 }

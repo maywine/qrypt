@@ -2,20 +2,27 @@ package vfs
 
 import (
 	"context"
+	"fmt"
+	pathpkg "path"
 	"strings"
 	"time"
 
 	"github.com/yinzhenyu/qrypt/pkg/drive"
 	"github.com/yinzhenyu/qrypt/pkg/logging"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/upload"
+	"github.com/yinzhenyu/qrypt/pkg/vfs/vfstypes"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/view"
 )
 
 func (v *VFS) PrepareDirectoryCopy(ctx context.Context, path string) error {
+	v.subtreeMu.RLock()
+	defer v.subtreeMu.RUnlock()
 	return v.prepareDirectoryCopyWithRuntime(ctx, path, newVFSDirectoryCopyRuntime(v))
 }
 
 func (v *VFS) Mkdir(ctx context.Context, path string) (entry drive.Entry, err error) {
+	v.subtreeMu.RLock()
+	defer v.subtreeMu.RUnlock()
 	return v.mkdirWithDeps(ctx, path, newVFSDriverRuntime(v.driver, v.testEnabled).MutationBackend(), newVFSViewCommitter(v), newVFSViewCommitter(v))
 }
 
@@ -32,6 +39,8 @@ func (v *VFS) RemoveDir(ctx context.Context, path string) (err error) {
 }
 
 func (v *VFS) Rename(ctx context.Context, oldPath, newPath string) (err error) {
+	v.subtreeMu.RLock()
+	defer v.subtreeMu.RUnlock()
 	return v.renameWithDeps(ctx, oldPath, newPath, newVFSDriverRuntime(v.driver, v.testEnabled).MutationBackend(), newVFSMutationRuntime(v), newVFSViewCommitter(v))
 }
 
@@ -94,7 +103,7 @@ type mutationRuntime interface {
 	RenamePendingUpload(oldPath, newPath string, pending PendingUpload) error
 	// RebasePendingUploads moves the pending uploads of the renamed
 	// directory's descendants onto the renamed subtree.
-	RebasePendingUploads(oldPath, newPath string, entry drive.Entry) error
+	RebasePendingUploads(ctx context.Context, oldPath, newPath string, entry drive.Entry) error
 }
 
 // readCacheInvalidator drops a committed entry's read-cache state. *VFS
@@ -106,22 +115,18 @@ type readCacheInvalidator interface {
 }
 
 type vfsMutationRuntime struct {
-	invalidator       readCacheInvalidator
-	viewRT            view.Runtime
-	store             *uploadStore
-	hashes            *upload.HashTracker
-	uploads           *uploadService
-	schedulingEnabled func() bool
+	invalidator  readCacheInvalidator
+	viewRT       view.Runtime
+	uploads      *upload.Domain
+	listChildren func(context.Context, string) ([]drive.Entry, error)
 }
 
 func newVFSMutationRuntime(v *VFS) vfsMutationRuntime {
 	return vfsMutationRuntime{
-		invalidator:       v,
-		viewRT:            view.NewRuntime(v.view),
-		store:             v.uploads.Store(),
-		hashes:            v.hashes,
-		uploads:           v.uploads,
-		schedulingEnabled: v.uploadSchedulingEnabled,
+		invalidator:  v,
+		viewRT:       view.NewRuntime(v.view),
+		uploads:      v.uploads,
+		listChildren: v.driver.List,
 	}
 }
 
@@ -131,26 +136,15 @@ func (r vfsMutationRuntime) InvalidateReadCache(entry drive.Entry) {
 
 func (r vfsMutationRuntime) RenamePendingUpload(oldPath, newPath string, pending PendingUpload) error {
 	r.viewRT.MoveLocalModTime(oldPath, newPath)
-	if err := r.store.RenameUpload(oldPath, pending); err != nil {
+	if err := r.uploads.RenamePending(oldPath, newPath, pending); err != nil {
 		return err
 	}
-	r.hashes.RenamePath(oldPath, newPath, pending)
 	// The source path only ever existed as a local pending projection; drop its
 	// cached identity or LocalChildren keeps re-injecting the old name into
 	// every listing after the upload has moved to the new path.
 	r.viewRT.DropEntryPath(oldPath)
-	if !r.schedulingEnabled() {
-		return nil
-	}
-	// Debounce timers and the worker queue are keyed by path: the entry
-	// scheduled for the pre-rename path can only miss its latest-record
-	// lookup and be dropped, leaving the frozen pending unscheduled forever.
-	// Drop it and schedule the renamed record instead. Mutable (unflushed)
-	// records stay unscheduled - their next flush schedules them.
-	r.uploads.CancelUpload(oldPath)
 	if pending.Frozen {
 		logging.L.InfofEvery("vfs.rename_reschedule_upload", time.Second, "[VFS] reschedule renamed upload op_id=%q path=%q old_path=%q size=%d", pending.FID, newPath, oldPath, pending.Size)
-		r.uploads.Enqueue(pending)
 	}
 	return nil
 }
@@ -162,22 +156,55 @@ func (r vfsMutationRuntime) RenamePendingUpload(oldPath, newPath string, pending
 // exists. The recorded parent is the entry the rename reported; drivers that
 // keep entry IDs stable across a move (cloud APIs) upload straight into the
 // renamed directory.
-func (r vfsMutationRuntime) RebasePendingUploads(oldPath, newPath string, entry drive.Entry) error {
-	moved, err := r.store.RebaseUploadsUnder(oldPath, newPath, entry.ID)
+func (r vfsMutationRuntime) RebasePendingUploads(ctx context.Context, oldPath, newPath string, entry drive.Entry) error {
+	// A provider may change directory IDs when moving it (localfs uses full
+	// paths as IDs). Resolve each distinct new parent from the backend rather
+	// than assigning the moved directory's ID to every nested descendant.
+	parents := map[string]string{vfstypes.CleanVirtualPath(newPath): entry.ID}
+	for _, pending := range r.uploads.PendingUploads() {
+		if !vfstypes.IsPathUnder(pending.Path, oldPath) {
+			continue
+		}
+		nextPath := vfstypes.CleanVirtualPath(newPath + strings.TrimPrefix(pending.Path, oldPath))
+		parentPath := pathpkg.Dir(nextPath)
+		if _, ok := parents[parentPath]; ok {
+			continue
+		}
+		// Resolve each segment once, starting at the renamed directory. The
+		// view's rebased cache may still hold old IDs, so use driver listings.
+		relative := strings.TrimPrefix(parentPath, vfstypes.CleanVirtualPath(newPath)+"/")
+		currentPath := vfstypes.CleanVirtualPath(newPath)
+		for _, name := range strings.Split(relative, "/") {
+			nextParent := vfstypes.JoinVirtualPath(currentPath, name)
+			if _, ok := parents[nextParent]; !ok {
+				children, err := r.listChildren(ctx, parents[currentPath])
+				if err != nil {
+					return err
+				}
+				found := false
+				for _, child := range children {
+					if child.Name == name && child.IsDir {
+						parents[nextParent] = child.ID
+						found = true
+						break
+					}
+				}
+				if !found {
+					return fmt.Errorf("%w: renamed parent %s", drive.ErrNotFound, nextParent)
+				}
+			}
+			currentPath = nextParent
+		}
+	}
+	moved, err := r.uploads.RebasePending(oldPath, newPath, parents)
 	if err != nil {
 		return err
 	}
-	for _, next := range moved {
-		oldChild := oldPath + strings.TrimPrefix(next.Path, newPath)
-		r.viewRT.MoveLocalModTime(oldChild, next.Path)
-		r.hashes.RenamePath(oldChild, next.Path, next)
-		if !r.schedulingEnabled() {
-			continue
-		}
-		r.uploads.CancelUpload(oldChild)
+	for _, item := range moved {
+		next := item.Pending
+		r.viewRT.MoveLocalModTime(item.OldPath, next.Path)
 		if next.Frozen {
-			logging.L.InfofEvery("vfs.rename_rebase_upload", time.Second, "[VFS] reschedule rebased upload op_id=%q path=%q old_path=%q size=%d", next.FID, next.Path, oldChild, next.Size)
-			r.uploads.Enqueue(next)
+			logging.L.InfofEvery("vfs.rename_rebase_upload", time.Second, "[VFS] reschedule rebased upload op_id=%q path=%q old_path=%q size=%d", next.FID, next.Path, item.OldPath, next.Size)
 		}
 	}
 	return nil

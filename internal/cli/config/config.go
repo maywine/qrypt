@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
+	"github.com/yinzhenyu/qrypt/internal/cli/i18n"
 	cliruntime "github.com/yinzhenyu/qrypt/internal/cli/runtime"
 	"github.com/yinzhenyu/qrypt/pkg/config"
 	"github.com/yinzhenyu/qrypt/pkg/util"
@@ -15,8 +16,13 @@ func NewCommand(rt cliruntime.Runtime) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "config",
 		Short: "Create and inspect configuration",
-		Args:  cliruntime.CommandGroupArgs(rt, nil),
-		RunE:  cliruntime.ShowHelp,
+		Long: `Create a starter config, inspect the resolved config, validate it, and
+export the rclone-compatible encryption password for a mount.`,
+		Example: `  qrypt config init ./qrypt.toml
+  qrypt config show
+  qrypt config validate --config ./qrypt.toml`,
+		Args: cliruntime.CommandGroupArgs(rt, nil),
+		RunE: cliruntime.ShowHelp,
 	}
 	cmd.AddCommand(NewInitCmd(rt))
 	cmd.AddCommand(NewPathCmd(rt))
@@ -30,7 +36,11 @@ func NewValidateCmd(rt cliruntime.Runtime) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "validate",
 		Short: "Validate configuration without connecting to remote drives",
-		Args:  cliruntime.NoArgs(rt),
+		Long: `Check that the config file parses and passes static validation. No remote
+drive is contacted, so this is safe to run before mounting.`,
+		Example: `  qrypt config validate
+  qrypt config validate --config ./qrypt.toml`,
+		Args: cliruntime.NoArgs(rt),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			state, err := rt.CommandConfig(cmd)
 			if err != nil {
@@ -42,7 +52,7 @@ func NewValidateCmd(rt cliruntime.Runtime) *cobra.Command {
 			if err := config.Validate(state.Cfg); err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "Config valid: %s\n", state.Path)
+			fmt.Fprintf(cmd.OutOrStdout(), "%s\n", i18n.FromCommand(cmd).T("out.config.valid", state.Path))
 			return nil
 		},
 	}
@@ -54,7 +64,11 @@ func NewInitCmd(rt cliruntime.Runtime) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "init [PATH]",
 		Short: "Write a starter config",
-		Args:  cliruntime.MaxArgs(rt, 1),
+		Long: `Write a commented starter config (and its local storage directory) to
+PATH, or ./qrypt.toml when PATH is omitted.`,
+		Example: `  qrypt config init
+  qrypt config init ./qrypt.toml --force`,
+		Args: cliruntime.MaxArgs(rt, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			force, _ := cmd.Flags().GetBool("force")
 			outPath := "./qrypt.toml"
@@ -73,7 +87,7 @@ func NewInitCmd(rt cliruntime.Runtime) *cobra.Command {
 				return fmt.Errorf("%s already exists (use --force to overwrite)", outPath)
 			}
 
-			content, err := GenerateTemplate(starterRoot)
+			content, err := GenerateTemplateLocalized(starterRoot, i18n.FromCommand(cmd))
 			if err != nil {
 				return err
 			}
@@ -88,8 +102,9 @@ func NewInitCmd(rt cliruntime.Runtime) *cobra.Command {
 				return err
 			}
 
-			fmt.Fprintf(cmd.ErrOrStderr(), "Wrote config to %s\n", outPath)
-			fmt.Fprintf(cmd.ErrOrStderr(), "Created local storage at %s\n", starterRoot)
+			loc := i18n.FromCommand(cmd)
+			fmt.Fprintf(cmd.ErrOrStderr(), "%s\n", loc.T("out.config.wrote", outPath))
+			fmt.Fprintf(cmd.ErrOrStderr(), "%s\n", loc.T("out.config.storage_created", starterRoot))
 			return nil
 		},
 	}

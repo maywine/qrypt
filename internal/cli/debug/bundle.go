@@ -11,15 +11,25 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/yinzhenyu/qrypt/internal/cli/i18n"
 	cliruntime "github.com/yinzhenyu/qrypt/internal/cli/runtime"
 	"github.com/yinzhenyu/qrypt/pkg/util"
 )
+
+func bundleWrittenMessage(loc *i18n.Localizer, path string) string {
+	return loc.T("out.debug.bundle.wrote", path)
+}
 
 func NewBundleCmd(rt cliruntime.Runtime) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "bundle [REMOTE]",
 		Short: "Write an AI-oriented debug bundle zip",
-		Args:  cliruntime.MaxArgs(rt, 1),
+		Long: `Write a zip bundle of AI-oriented diagnostics: the collect report,
+diagnostics, and raw debug endpoints, optionally including a watch report and
+path or destination diagnostics for REMOTE.`,
+		Example: `  qrypt debug bundle --out /tmp/qrypt-debug.zip
+  qrypt debug bundle /cloud/photos --out /tmp/qrypt-debug.zip --watch 30s`,
+		Args: cliruntime.MaxArgs(rt, 1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			socket := debugSocketFromContext(ctx)
@@ -48,7 +58,7 @@ func NewBundleCmd(rt cliruntime.Runtime) *cobra.Command {
 				return fmt.Errorf("--watch must not be negative")
 			}
 			if watchDuration == 0 && cmd.Flags().Changed("watch-interval") {
-				return fmt.Errorf("--watch-interval requires --watch\n\nExample:\n  qrypt debug bundle --socket /tmp/qrypt.sock --out /tmp/qrypt-debug.zip --watch 30s --watch-interval 2s")
+				return fmt.Errorf("--watch-interval requires --watch\n\nExample:\n  qrypt debug bundle --out /tmp/qrypt-debug.zip --watch 30s --watch-interval 2s")
 			}
 			if watchDuration > 0 {
 				if err := cliruntime.ValidateSamplingWindow(watchDuration, watchInterval, "watch", "watch-interval"); err != nil {
@@ -178,7 +188,7 @@ func NewBundleCmd(rt cliruntime.Runtime) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.ErrOrStderr(), "Wrote debug bundle to %s\n", outPath)
+			fmt.Fprintln(cmd.ErrOrStderr(), bundleWrittenMessage(i18n.FromCommand(cmd), outPath))
 			return nil
 		},
 		ValidArgsFunction: cliruntime.NoFileCompletions,

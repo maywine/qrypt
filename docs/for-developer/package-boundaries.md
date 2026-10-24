@@ -23,6 +23,21 @@ Composition roots may register concrete drivers through `pkg/drivers/all`.
 All other dependencies point toward lower-level contracts. A package must not
 bypass the layer directly below it merely to reuse an implementation type.
 
+`scripts/ci/check-arch.sh` enforces this contract from Go package metadata.
+Every top-level package under `pkg` declares the other top-level packages its
+production code may import; packages not present in that policy fail the gate.
+Tests follow the same private-application and provider-direction rules, while
+remaining free to use test adapters such as `localfs` where the production
+policy deliberately forbids concrete drivers.
+
+The gate also parses the upload module's Go declarations: `VFS` may own upload
+state through `upload.Domain`, while `upload.Domain` must not expose its store,
+hash tracker, scheduler service or engine through exported fields or method
+results. This is a type/ownership check, not a blacklist of receiver or method
+names. The compiler and this gate do not prove that re-exported value types
+preserve every semantic client contract; compatibility tests remain responsible
+for those contracts.
+
 ## Ownership table
 
 | Package | Owns | Must not own |
@@ -37,8 +52,8 @@ bypass the layer directly below it merely to reuse an implementation type.
 | `pkg/core/internal/*` | Application services hidden behind `core.Core` | Public entry points that let clients bypass `core.Core` |
 | `pkg/mobile` | Gomobile-safe sessions, handles, callbacks and JSON envelopes | VFS/media/task implementation types or business workflows |
 | `pkg/mount` | FUSE translation, handles, mount lifecycle and OS compatibility | Provider calls or provider-independent filesystem semantics |
-| `pkg/control` | Local diagnostic HTTP transport, validation and response encoding | Contract-test execution, benchmarks or runtime probing algorithms |
-| `pkg/diagnostic/*` | Explicit diagnostic checks, benchmarks and runtime probes | HTTP routing or normal filesystem execution paths |
+| `pkg/media` | Media probing and virtual-file mapping: MP4 probe, virtual-file info and read mappings, virtual-file handles | VFS domain state, task orchestration or provider protocol |
+| `pkg/control` | Local debug/probe/control HTTP transports, validation, route adapters and response encoding | Provider behavior, task orchestration or reusable diagnostic algorithms |
 | `pkg/syncer` | Sync comparison, planning, snapshots and execution | Debug HTTP or client adaptation |
 | `internal/cli` | Cobra commands and desktop process integration | Reusable domain behavior |
 
@@ -99,7 +114,7 @@ Every boundary migration must satisfy all of the following:
 3. Architecture checks reject the dependency that was removed.
 4. Focused tests cover behavior and lifecycle/error paths affected by the
    migration.
-5. `scripts/ci-check.sh` passes before merge.
+5. `scripts/ci/check-all.sh` passes before merge.
 6. Generated documentation is changed through its generator, never by editing
    generated output directly.
 7. Unrelated worktree changes are preserved and excluded from the merge.
@@ -119,14 +134,14 @@ Verification is layered rather than report-driven:
 1. Inspect dependency direction, public API and JSON compatibility, lifecycle,
    cancellation, errors, concurrency, and the validity of new tests.
 2. Run focused tests and focused race tests independently of the worker.
-3. Run vet, the repository-pinned linters, build, `scripts/check-arch.sh`, and
+3. Run vet, the repository-pinned linters, build, `scripts/ci/check-arch.sh`, and
    `git diff --check`.
-4. Run the complete `scripts/ci-check.sh` before committing. Package-level
+4. Run the complete `scripts/ci/check-all.sh` before committing. Package-level
    checks are not a substitute for this gate.
 
-When a new architecture rule is added, verify that a temporary violating
-import makes `scripts/check-arch.sh` fail, remove the probe, and verify the
-clean tree passes. Tests must prove the contract they claim: interface
+When a new architecture rule is added, add a focused checker test that makes
+the forbidden import or ownership shape fail, then verify the clean repository
+passes `scripts/ci/check-arch.sh`. Tests must prove the contract they claim: interface
 satisfaction does not pin an exact concrete type, and race tests must not
 mutate process-wide timing variables while background workers are active.
 

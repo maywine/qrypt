@@ -2,48 +2,59 @@
 
 # qrypt
 
-[![CI](https://github.com/yinzhenyu-su/qrypt/actions/workflows/ci.yaml/badge.svg)](https://github.com/yinzhenyu-su/qrypt/actions/workflows/ci.yaml)
-[![Contract Tests](https://github.com/yinzhenyu-su/qrypt/actions/workflows/contract.yaml/badge.svg)](https://github.com/yinzhenyu-su/qrypt/actions/workflows/contract.yaml)
-[![Nightly Quality Gates](https://github.com/yinzhenyu-su/qrypt/actions/workflows/nightly.yaml/badge.svg)](https://github.com/yinzhenyu-su/qrypt/actions/workflows/nightly.yaml)
-[![Go](https://img.shields.io/github/go-mod/go-version/yinzhenyu-su/qrypt)](https://go.dev)
-[![License](https://img.shields.io/github/license/yinzhenyu-su/qrypt)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/yinzhenyu-su/qrypt)](https://github.com/yinzhenyu-su/qrypt/releases)
+[![CI](https://github.com/maywine/qrypt/actions/workflows/ci.yaml/badge.svg)](https://github.com/maywine/qrypt/actions/workflows/ci.yaml)
+[![Contract Tests](https://github.com/maywine/qrypt/actions/workflows/contract.yaml/badge.svg)](https://github.com/maywine/qrypt/actions/workflows/contract.yaml)
+[![Nightly Quality Gates](https://github.com/maywine/qrypt/actions/workflows/nightly.yaml/badge.svg)](https://github.com/maywine/qrypt/actions/workflows/nightly.yaml)
+[![Go](https://img.shields.io/github/go-mod/go-version/maywine/qrypt)](https://go.dev)
+[![License](https://img.shields.io/github/license/maywine/qrypt)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/maywine/qrypt)](https://github.com/maywine/qrypt/releases)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-blue)](#requirements)
 
 qrypt turns your cloud drives into one encrypted local folder — mount it, open it, use it like any other drive.
 
 ![Encryption comparison](artifacts/compare.png)
 
-## Features
+## Introduction
 
-- **FUSE mount** — mounts all configured drives as subdirectories under one local directory
-- **rclone-compatible encryption** — filename obfuscation and content encryption compatible with rclone crypt
-- **Pluggable cloud drive backends** — see [supported drivers](docs/for-user/support-drivers.md) for the full list
-- **Local read cache** — caches remote file data locally for fast repeated access
-- **Staged writes** — new files and modifications are written locally first, then uploaded asynchronously with configurable debounce, concurrency, and retry
-- **Platform-native FUSE** — macOS (macFUSE), Linux (libfuse), Windows (WinFsp)
-- **macOS friendly** — suppresses Apple Double metadata files and extended attributes clutter in Finder
-- **Diagnostics** — debug socket with structured JSON reports, health tracking per mount, consistency checks, and staging inspection
-- **Bandwidth control** — per-direction download and upload rate limiting
-- **Config auto-discovery** — searches `./qrypt.toml`, `~/.qrypt/qrypt.toml`, then `$XDG_CONFIG_HOME/qrypt/qrypt.toml` on Unix or `%AppData%\qrypt\qrypt.toml` on Windows
+qrypt maps your cloud drives into a single encrypted local folder. Once mounted, you can browse and edit files as if they were on a local disk.
 
-## Requirements
+- **Single mount point** — all drives appear under one directory, each in its own subdirectory
+- **Encrypted storage** — filenames and content are encrypted before they reach the cloud, compatible with rclone crypt
+- **Staged writes and local cache** — writes land locally first and upload in the background; repeated reads hit the cache
+- **Cross-platform** — macOS, Linux, and Windows
+- **Works without mounting** — `qrypt fs` reads and writes remote files directly, useful in scripts and on servers
 
-| Dependency             | macOS                          | Linux                           | Windows                       |
-| ---------------------- | ------------------------------ | ------------------------------- | ----------------------------- |
-| FUSE                   | [macFUSE](https://macfuse.io/) | none (libfuse3 statically linked) | [WinFsp](https://winfsp.dev/) |
-| Go (source build only) | 1.27+                          | 1.27+                           | 1.27+                         |
+## Install
 
-The `fs` commands (list, cat, get, put) do not require FUSE — only `mount` does.
-Config files are discovered automatically; you can skip `--config` when the file
-is at one of the standard paths (see [CLI Reference](docs/for-user/cli.md)).
+**Linux / macOS**
+
+```sh
+curl -fsSL https://github.com/maywine/qrypt/releases/latest/download/install.sh | sh
+```
+
+**Windows** (run in any terminal; no need to open PowerShell first)
+
+```powershell
+powershell -c "irm https://github.com/maywine/qrypt/releases/latest/download/install.ps1|iex"
+```
+
+The installer picks the right build for your system and needs no administrator
+rights. Open a new terminal afterwards and run `qrypt version` to confirm.
+
+Update or remove qrypt later with `qrypt upgrade` and `qrypt uninstall` (see the
+[quickstart](docs/for-user/quickstart.md)).
 
 ## Quick Start
 
-1. Download the [latest release](https://github.com/yinzhenyu-su/qrypt/releases) for your platform.
-2. Create `qrypt.toml`:
+The example below uses a local directory, so no cloud account is required. It
+covers configuration, upload, read, and encryption.
+
+### 1. Create a config file
 
 ```toml
+version = "1"
+
+[mount]
 mount_point = "~/Qrypt"
 
 [[mounts]]
@@ -57,49 +68,63 @@ root_path = "/tmp/qrypt-data"
 password = "my-password"
 filename_encryption = "standard"
 filename_encoding = "base32"
-# content_dedup = false  # true improves instant upload/dedup but leaks content equality
 ```
 
-3.1 Run without mounting:
+### 2. Upload and read a file
 
 ```bash
 mkdir -p /tmp/qrypt-data
-./qrypt fs list /
 echo "hello qrypt" > /tmp/hello.txt
-./qrypt fs put /tmp/hello.txt /local/hello.txt
-./qrypt fs cat /local/hello.txt
+
+qrypt fs list /
+qrypt fs put /tmp/hello.txt /local/hello.txt
+qrypt fs cat /local/hello.txt
 ```
 
-Check the backend storage — filenames are obfuscated:
+The last command prints `hello qrypt`.
+
+### 3. Inspect the encryption
 
 ```bash
 ls /tmp/qrypt-data
 ```
 
-Output similar to:
+The filename is now an obfuscated string such as
+`b4l6gr1s6t1q0tas6dl0q0mb0s62kbj0`, and the file content is encrypted as well.
 
-```
-b4l6gr1s6t1q0tas6dl0q0mb0s62kbj0
-```
-
-Both the original filename and content are encrypted.
-
-3.2 Mount and use like a local folder:
+## Mount as a Local Folder (Optional)
 
 ```bash
-./qrypt mount
+qrypt mount
 ```
 
-Open `~/Qrypt` in your file manager — drag, drop, open files as if they were
-local. Everything is encrypted on the backend.
+Open `~/Qrypt` in your file manager and use it like any other folder: drag files
+in, open them, delete them.
 
-Extended walkthrough →
-[docs/for-user/quickstart.md](docs/for-user/quickstart.md).
+> Only `mount` needs FUSE: install [macFUSE](https://macfuse.io/) on macOS or
+> [WinFsp](https://winfsp.dev/) on Windows. The `fs` commands do not need it.
+
+Detailed walkthrough (including Windows notes) →
+[Quickstart](docs/for-user/quickstart.md)
+
+## Requirements
+
+| Dependency             | macOS                          | Linux                           | Windows                       |
+| ---------------------- | ------------------------------ | ------------------------------- | ----------------------------- |
+| FUSE                   | [macFUSE](https://macfuse.io/) | libfuse3 / fuse3                | [WinFsp](https://winfsp.dev/) |
+| Go (source build only) | 1.27+                          | 1.27+                           | 1.27+                         |
+
+Config files are discovered automatically: `./qrypt.toml`,
+`~/.qrypt/qrypt.toml`, then `$XDG_CONFIG_HOME/qrypt/qrypt.toml` on Unix or
+`%AppData%\qrypt\qrypt.toml` on Windows. You can skip `--config` when the file
+is at one of these paths (see [CLI Reference](docs/for-user/cli.md)).
 
 ## User Documentation
 
-- [Quickstart](docs/for-user/quickstart.md) — minimal config, encryption demo, Windows notes
+- [Quickstart](docs/for-user/quickstart.md) — install, upgrade and uninstall, minimal config, a first run in about 5 minutes, encryption demo
 - [CLI Reference](docs/for-user/cli.md) — commands, arguments, config discovery paths
+- [Offline Download](docs/for-user/offline-download.md) — hand magnet links or downloads to the cloud drive
+- [Troubleshooting](docs/for-user/troubleshooting.md) — stale mounts, upload queue, and other common issues
 - [Full Config Reference](docs/for-user/full-config.md) — all configuration options
 - [Supported Drivers](docs/for-user/support-drivers.md) — driver parameters and examples
 
@@ -120,7 +145,7 @@ Linux builds use FUSE3 by default; mounting also requires the fuse3 runtime and
 `/dev/fuse`. Legacy FUSE2 builds can be produced with `-tags fuse2`.
 
 ```
-git clone https://github.com/yinzhenyu-su/qrypt.git
+git clone https://github.com/maywine/qrypt.git
 cd qrypt
 go build ./cmd/qrypt
 ```

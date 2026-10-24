@@ -136,25 +136,25 @@ size `S`) differ by 2-3x:
    source netdisk; the hashes require one sequential pass. This is the
    unavoidable 1x.
 
-2. **FUSE write path writes the staging file** (`staging_write.go`). Every
+2. **FUSE write path writes the staging file** (`pkg/vfs/staging.go`). Every
    `WriteAt` goes into a local staging file before the upload worker streams
    it to the destination driver. This 1x is inherent to the
    write-then-upload model.
 
-3. **Reading the source may write the read cache** (`read_window.go`
+3. **Reading the source may write the read cache** (`pkg/vfs/read/reader.go`
    `StoreChunk` -> `PutChunkAsync`). Unlike cache seeding, the read path has
    **no large-file skip**: every fetched chunk is persisted even though a
    one-shot copy will never reuse it. Eviction later reclaims large entries
-   (`read_cache_eviction.go`), but the write has already happened. This is
+   (`pkg/vfs/readcache/eviction.go`), but the write has already happened. This is
    pure amplification for a copy.
 
-4. **Cache seeding writes the staging file again** (`upload_snapshot.go`
+4. **Cache seeding writes the staging file again** (`pkg/vfs/upload.go`
    `seedReadCacheFromStaging` -> `PutLocalFile`). After a successful upload
    the staging file is copied into cache batch files. Files at or above
    `readCacheLargeFileBytes` (16 MiB) are skipped, so this is at most 1x for
    small files.
 
-5. **Upload journal appends** (`upload_journal.go`) write a small record per
+5. **Upload journal appends** (`pkg/vfs/upload/store.go`) write a small record per
    pending-state transition (created / flushed / failed / committed) and are
    periodically compacted without fsync. This is negligible in bytes but is
    the reason the pending count grows during a copy.

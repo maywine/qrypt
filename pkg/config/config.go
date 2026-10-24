@@ -147,15 +147,6 @@ type DebugConfig struct {
 	Token   string `toml:"token"`
 }
 
-const DefaultDebugListen = "127.0.0.1:19090"
-
-func (c DebugConfig) EffectiveListen() string {
-	if c.Listen != "" {
-		return c.Listen
-	}
-	return DefaultDebugListen
-}
-
 type TimeConfig struct {
 	NTPEnabled      *bool    `toml:"ntp_enabled"`
 	NTPServers      []string `toml:"ntp_servers"`
@@ -202,7 +193,9 @@ func Load(path string) (*Config, error) {
 		for _, key := range undecoded {
 			keys = append(keys, key.String())
 		}
-		return nil, fmt.Errorf("unknown configuration keys: %s", strings.Join(keys, ", "))
+		if len(keys) > 0 {
+			return nil, fmt.Errorf("unknown configuration keys: %s", strings.Join(keys, ", "))
+		}
 	}
 	return &cfg, nil
 }

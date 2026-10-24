@@ -16,21 +16,36 @@ import (
 func NewBenchCmd(rt cliruntime.Runtime) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "bench",
-		Short: "Run machine-comparable debug benchmarks",
-		Args:  cliruntime.CommandGroupArgs(rt, nil),
-		RunE:  cliruntime.ShowHelp,
+		Short: "Run machine-comparable probe benchmarks",
+		Long: `Run machine-comparable benchmarks against mounted drives, or compare two
+saved benchmark reports. Benchmarks may write remote or VFS test data.`,
+		Example: `  qrypt probe bench crud --mount cloud
+  qrypt probe bench fs --mount cloud --size 64m`,
+		Args: cliruntime.CommandGroupArgs(rt, nil),
+		RunE: cliruntime.ShowHelp,
 	}
-	cmd.AddCommand(withDebugSocketFlag(rt, newDebugBenchCaseCmd(rt, "crud", "Run a CRUD driver benchmark")))
-	cmd.AddCommand(withDebugSocketFlag(rt, newDebugBenchCaseCmd(rt, "fs", "Run a VFS filesystem benchmark")))
-	cmd.AddCommand(withDebugSocketFlag(rt, newDebugBenchCaseCmd(rt, "xfer", "Run a transfer benchmark")))
+	cmd.AddCommand(withProbeSocketFlag(rt, newDebugBenchCaseCmd(rt, "crud", "Run a CRUD driver benchmark")))
+	cmd.AddCommand(withProbeSocketFlag(rt, newDebugBenchCaseCmd(rt, "fs", "Run a VFS filesystem benchmark")))
+	cmd.AddCommand(withProbeSocketFlag(rt, newDebugBenchCaseCmd(rt, "xfer", "Run a transfer benchmark")))
 	cmd.AddCommand(newDebugBenchCompareCmd(rt))
 	return cmd
 }
 
 func newDebugBenchCaseCmd(rt cliruntime.Runtime, test, short string) *cobra.Command {
+	long := map[string]string{
+		"crud": "Run a CRUD benchmark against one mount, measuring create, read, update, and delete latency and throughput.",
+		"fs":   "Run a filesystem benchmark through the VFS layer on one mount, measuring write and read throughput at the requested size.",
+		"xfer": "Run a transfer benchmark from --source to --dest, measuring end-to-end throughput between two mounts.",
+	}[test]
+	example := "  qrypt probe bench " + test + " --mount cloud"
+	if test == "xfer" {
+		example = "  qrypt probe bench xfer --source local --dest cloud"
+	}
 	cmd := &cobra.Command{
 		Use:               test,
 		Short:             short,
+		Long:              long,
+		Example:           example,
 		Args:              cliruntime.NoArgs(rt),
 		ValidArgsFunction: cliruntime.NoFileCompletions,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -56,6 +71,8 @@ func newDebugBenchCompareCmd(rt cliruntime.Runtime) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:               "compare",
 		Short:             "Compare two benchmark reports",
+		Long:              `Compare a baseline and a current benchmark report and print the per-metric deltas as JSON.`,
+		Example:           `  qrypt probe bench compare --base before.json --current after.json`,
 		Args:              cliruntime.NoArgs(rt),
 		ValidArgsFunction: cliruntime.NoFileCompletions,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -90,15 +107,18 @@ func runDebugDriverBench(cmd *cobra.Command, test string) error {
 	req := contracttest.DriverTestRequest{Test: strings.ToLower(test)}
 	if flag := cmd.Flags().Lookup("mount"); flag != nil {
 		req.Mount, _ = cmd.Flags().GetString("mount")
+		req.Mount = contracttest.NormalizeMountName(req.Mount)
 	}
 	if flag := cmd.Flags().Lookup("size"); flag != nil {
 		req.Size, _ = cmd.Flags().GetString("size")
 	}
 	if flag := cmd.Flags().Lookup("source"); flag != nil {
 		req.Source, _ = cmd.Flags().GetString("source")
+		req.Source = contracttest.NormalizeMountName(req.Source)
 	}
 	if flag := cmd.Flags().Lookup("dest"); flag != nil {
 		req.Dest, _ = cmd.Flags().GetString("dest")
+		req.Dest = contracttest.NormalizeMountName(req.Dest)
 	}
 	if flag := cmd.Flags().Lookup("vfs"); flag != nil {
 		req.VFS, _ = cmd.Flags().GetBool("vfs")
@@ -116,9 +136,9 @@ func runDebugDriverBench(cmd *cobra.Command, test string) error {
 	body, err := debugSocketPostJSON(cmd.Context(), "/v1/bench", req)
 	if err != nil {
 		if detail, routeMissing := debugSocket404Detail(err); detail != "" {
-			return fmt.Errorf("debug bench failed: %s", detail)
+			return fmt.Errorf("probe benchmark failed: %s", detail)
 		} else if routeMissing {
-			return fmt.Errorf("debug bench endpoint is not available on this socket; restart the qrypt mount process with the current binary")
+			return fmt.Errorf("probe benchmark endpoint is not available on this socket; restart the qrypt mount process with the current binary")
 		}
 		return err
 	}
@@ -137,14 +157,14 @@ func ValidateDriverBenchRequest(req contracttest.DriverTestRequest) error {
 			return fmt.Errorf("fs benchmark only supports --mount and --size")
 		}
 		if req.Mount == "" {
-			return fmt.Errorf("fs benchmark requires --mount\n\nExample:\n  qrypt debug bench fs --mount cloud --socket /tmp/qrypt.sock")
+			return fmt.Errorf("fs benchmark requires --mount\n\nExample:\n  qrypt probe bench fs --mount cloud")
 		}
 	case "xfer":
 		if req.Mount != "" {
-			return fmt.Errorf("xfer benchmark uses --source and --dest, not --mount\n\nExample:\n  qrypt debug bench xfer --source local --dest cloud --socket /tmp/qrypt.sock")
+			return fmt.Errorf("xfer benchmark uses --source and --dest, not --mount\n\nExample:\n  qrypt probe bench xfer --source local --dest cloud")
 		}
 		if req.Source == "" || req.Dest == "" {
-			return fmt.Errorf("xfer benchmark requires --source and --dest\n\nExample:\n  qrypt debug bench xfer --source local --dest cloud --socket /tmp/qrypt.sock")
+			return fmt.Errorf("xfer benchmark requires --source and --dest\n\nExample:\n  qrypt probe bench xfer --source local --dest cloud")
 		}
 		if req.Source == req.Dest {
 			return fmt.Errorf("xfer benchmark requires different source and dest mounts")

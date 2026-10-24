@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,36 +27,33 @@ func init() {
 			RootPath: params["root_path"],
 			BaseURL:  params["base_url"],
 			V2URL:    params["v2_url"],
+			WGKeys:   parseWGKeys(params["wg_keys"]),
 		}), nil
-	},
-		drive.ParamDef{
-			Name:        "cookie",
-			Type:        "string",
-			Required:    true,
-			Secret:      true,
-			Description: "Quark cloud drive authentication cookie",
-			Example:     "k1=v1; k2=v2",
-		},
-		drive.ParamDef{
-			Name:        "root_path",
-			Type:        "string",
-			Description: "Virtual root path on the drive",
-			Default:     "/",
-			Example:     "/qrypt",
-		},
-		drive.ParamDef{
-			Name:        "base_url",
-			Type:        "string",
-			Description: "Custom API base URL",
-			Example:     "https://drive.quark.cn",
-		},
-		drive.ParamDef{
-			Name:        "v2_url",
-			Type:        "string",
-			Description: "Custom API v2 URL",
-			Example:     "https://drive-m.quark.cn",
-		},
-	)
+	})
+}
+
+// parseWGKeys parses a "secureNo:hexkey,secureNo:hexkey" override list.
+func parseWGKeys(value string) map[int]string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	keys := map[int]string{}
+	for _, pair := range strings.Split(value, ",") {
+		numberText, key, ok := strings.Cut(strings.TrimSpace(pair), ":")
+		if !ok {
+			continue
+		}
+		number, err := strconv.Atoi(strings.TrimSpace(numberText))
+		if err != nil || strings.TrimSpace(key) == "" {
+			continue
+		}
+		keys[number] = strings.TrimSpace(key)
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	return keys
 }
 
 func New(cookie string, opts Options) *Driver {
@@ -63,13 +62,15 @@ func New(cookie string, opts Options) *Driver {
 		rootID = "0"
 	}
 	d := &Driver{
-		cl:               newClient(cookie, clientOptions{BaseURL: opts.BaseURL, V2URL: opts.V2URL}),
+		cl:               newClient(cookie, clientOptions{BaseURL: opts.BaseURL, V2URL: opts.V2URL, WGKeys: opts.WGKeys}),
 		cookie:           cookie,
-		configCookieHash: fmt.Sprintf("%x", sha256.Sum256([]byte(cookie))),
 		rootPath:         opts.RootPath,
 		rootID:           rootID,
 		cookieSource:     "config",
 		debugUploads:     map[string]quarkUploadDebug{},
+		wgKeys:           opts.WGKeys,
+		offlineSessions:  map[string]string{},
+		configCookieHash: fmt.Sprintf("%x", sha256.Sum256([]byte(cookie))),
 	}
 	d.cl.onCookieUpdate = d.saveUpdatedCookie
 	return d
@@ -151,6 +152,17 @@ type Driver struct {
 	sessions       *session.Index
 	sessionStoreMu sync.Mutex
 	sessionCancel  context.CancelFunc
+
+	// Offline adapter state. wgKeys overrides the built-in wg data-key table;
+	// offlineSessions holds accelerated download sessions keyed by provider
+	// task id (in-memory: a lost session degrades to the normal URL).
+	// offlineLayouts remembers, per task id, the entry the task produced, its
+	// staging parent, and whether the staged results are already complete. Core
+	// re-seeds it from persisted task metadata after a restart.
+	wgKeys          map[int]string
+	offlineMu       sync.Mutex
+	offlineSessions map[string]string
+	offlineLayouts  map[string]drive.OfflineLayout
 }
 
 type Options struct {
@@ -158,6 +170,9 @@ type Options struct {
 	RootID   string
 	BaseURL  string
 	V2URL    string
+	// WGKeys overrides the built-in wg data-key table for offline request
+	// encryption (secureNo → 16-byte hex key).
+	WGKeys map[int]string
 }
 
 type cookieState struct {

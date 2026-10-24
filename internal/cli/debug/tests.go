@@ -13,28 +13,54 @@ import (
 func NewTestCmd(rt cliruntime.Runtime) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "test",
-		Short: "Run write-capable debug tests",
-		Args:  cliruntime.CommandGroupArgs(rt, nil),
-		RunE:  cliruntime.ShowHelp,
+		Short: "Run active probe tests",
+		Long: `Run active driver or VFS probe tests against mounted drives. These tests
+may write remote test data, so they run against the mutable control socket.`,
+		Example: `  qrypt probe test auth --mount cloud
+  qrypt probe test crud --mount cloud`,
+		Args: cliruntime.CommandGroupArgs(rt, nil),
+		RunE: cliruntime.ShowHelp,
 	}
-	cmd.AddCommand(withDebugSocketFlag(rt, newDebugTestCaseCmd(rt, "auth", "Run a read-only auth driver test")))
-	cmd.AddCommand(withDebugSocketFlag(rt, newDebugTestCaseCmd(rt, "batchmove", "Move a batch of uploaded files through VFS")))
-	cmd.AddCommand(withDebugSocketFlag(rt, newDebugTestCaseCmd(rt, "batchupload", "Upload a batch of small files through VFS")))
-	cmd.AddCommand(withDebugSocketFlag(rt, newDebugTestCaseCmd(rt, "crud", "Run a CRUD driver test")))
-	cmd.AddCommand(withDebugSocketFlag(rt, newDebugTestCaseCmd(rt, "contract", "Run the driver behavioral contract suite")))
-	cmd.AddCommand(withDebugSocketFlag(rt, newDebugTestCaseCmd(rt, "fs", "Run a VFS filesystem smoke test")))
-	cmd.AddCommand(withDebugSocketFlag(rt, newDebugTestCaseCmd(rt, "instantupload", "Run an instant-upload driver test")))
-	cmd.AddCommand(withDebugSocketFlag(rt, newDebugTestCaseCmd(rt, "multipart", "Run a multipart/chunked upload driver test")))
-	cmd.AddCommand(withDebugSocketFlag(rt, newDebugTestCaseCmd(rt, "read", "Measure a complete read through a mounted filesystem")))
-	cmd.AddCommand(withDebugSocketFlag(rt, newDebugTestCaseCmd(rt, "resume", "Run a VFS resumable-upload test")))
-	cmd.AddCommand(withDebugSocketFlag(rt, newDebugTestCaseCmd(rt, "xfer", "Run a transfer driver test")))
+	cmd.AddCommand(withProbeSocketFlag(rt, newDebugTestCaseCmd(rt, "auth", "Run a read-only auth driver test")))
+	cmd.AddCommand(withProbeSocketFlag(rt, newDebugTestCaseCmd(rt, "batchmove", "Move a batch of uploaded files through VFS")))
+	cmd.AddCommand(withProbeSocketFlag(rt, newDebugTestCaseCmd(rt, "batchupload", "Upload a batch of small files through VFS")))
+	cmd.AddCommand(withProbeSocketFlag(rt, newDebugTestCaseCmd(rt, "crud", "Run a CRUD driver test")))
+	cmd.AddCommand(withProbeSocketFlag(rt, newDebugTestCaseCmd(rt, "contract", "Run the driver behavioral contract suite")))
+	cmd.AddCommand(withProbeSocketFlag(rt, newDebugTestCaseCmd(rt, "fs", "Run a VFS filesystem smoke test")))
+	cmd.AddCommand(withProbeSocketFlag(rt, newDebugTestCaseCmd(rt, "instantupload", "Run an instant-upload driver test")))
+	cmd.AddCommand(withProbeSocketFlag(rt, newDebugTestCaseCmd(rt, "multipart", "Run a multipart/chunked upload driver test")))
+	cmd.AddCommand(withProbeSocketFlag(rt, newDebugTestCaseCmd(rt, "read", "Measure a complete read through a mounted filesystem")))
+	cmd.AddCommand(withProbeSocketFlag(rt, newDebugTestCaseCmd(rt, "resume", "Run a VFS resumable-upload test")))
+	cmd.AddCommand(withProbeSocketFlag(rt, newDebugTestCaseCmd(rt, "xfer", "Run a transfer driver test")))
 	return cmd
 }
 
 func newDebugTestCaseCmd(rt cliruntime.Runtime, test, short string) *cobra.Command {
+	long := map[string]string{
+		"auth":          "Run a read-only auth driver test that verifies the mount can authenticate and list its root.",
+		"batchmove":     "Upload a batch of small files through VFS and move them, verifying batch operation correctness.",
+		"batchupload":   "Upload a batch of small files through VFS, verifying batch upload correctness.",
+		"crud":          "Run a CRUD driver test that creates, reads, updates, and deletes a remote object.",
+		"contract":      "Run the driver behavioral contract suite against the mount.",
+		"fs":            "Run a VFS filesystem smoke test on one mount at the requested size.",
+		"instantupload": "Run an instant-upload driver test, verifying a known file is saved without re-uploading its bytes.",
+		"multipart":     "Run a multipart or chunked upload driver test at the requested size.",
+		"read":          "Measure a complete read through a mounted filesystem, exercising cold and warm caches and seek behavior.",
+		"resume":        "Run a VFS resumable-upload test that interrupts and then resumes an upload.",
+		"xfer":          "Run a transfer driver test from --source to --dest.",
+	}[test]
+	example := "  qrypt probe test " + test + " --mount cloud"
+	switch test {
+	case "xfer":
+		example = "  qrypt probe test xfer --source local --dest cloud"
+	case "read":
+		example = "  qrypt probe test read --mount cloud --mount-point /mnt/qrypt/cloud"
+	}
 	cmd := &cobra.Command{
 		Use:               test,
 		Short:             short,
+		Long:              long,
+		Example:           example,
 		Args:              cliruntime.NoArgs(rt),
 		ValidArgsFunction: cliruntime.NoFileCompletions,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -83,12 +109,15 @@ func runDebugDriverTest(cmd *cobra.Command, test string) error {
 	req := contracttest.DriverTestRequest{Test: strings.ToLower(test)}
 	if flag := cmd.Flags().Lookup("mount"); flag != nil {
 		req.Mount, _ = cmd.Flags().GetString("mount")
+		req.Mount = contracttest.NormalizeMountName(req.Mount)
 	}
 	if flag := cmd.Flags().Lookup("source"); flag != nil {
 		req.Source, _ = cmd.Flags().GetString("source")
+		req.Source = contracttest.NormalizeMountName(req.Source)
 	}
 	if flag := cmd.Flags().Lookup("dest"); flag != nil {
 		req.Dest, _ = cmd.Flags().GetString("dest")
+		req.Dest = contracttest.NormalizeMountName(req.Dest)
 	}
 	if flag := cmd.Flags().Lookup("size"); flag != nil {
 		req.Size, _ = cmd.Flags().GetString("size")
@@ -139,9 +168,9 @@ func runDebugDriverTest(cmd *cobra.Command, test string) error {
 		// reason in the body; only a route-level 404 means the socket's binary
 		// predates this endpoint.
 		if detail, routeMissing := debugSocket404Detail(err); detail != "" {
-			return fmt.Errorf("debug test failed: %s", detail)
+			return fmt.Errorf("probe test failed: %s", detail)
 		} else if routeMissing {
-			return fmt.Errorf("debug test endpoint is not available on this socket; restart the qrypt mount process with the current binary")
+			return fmt.Errorf("probe test endpoint is not available on this socket; restart the qrypt mount process with the current binary")
 		}
 		return err
 	}
@@ -160,7 +189,7 @@ func ValidateDriverTestRequest(req contracttest.DriverTestRequest) error {
 			return fmt.Errorf("%s test only supports --mount and --size", req.Test)
 		}
 		if req.Mount == "" {
-			return fmt.Errorf("%s test requires --mount\n\nExample:\n  qrypt debug test %s --mount cloud --socket /tmp/qrypt.sock", req.Test, req.Test)
+			return fmt.Errorf("%s test requires --mount\n\nExample:\n  qrypt probe test %s --mount cloud", req.Test, req.Test)
 		}
 	case "read":
 		if req.Source != "" || req.Dest != "" || req.VFS || req.Count != 0 {
@@ -228,7 +257,7 @@ func ValidateDriverTestRequest(req contracttest.DriverTestRequest) error {
 			return fmt.Errorf("%s test only supports --mount, --count, and --size", req.Test)
 		}
 		if req.Mount == "" {
-			return fmt.Errorf("%s test requires --mount\n\nExample:\n  qrypt debug test %s --mount cloud --count 50 --size 4k --socket /tmp/qrypt.sock", req.Test, req.Test)
+			return fmt.Errorf("%s test requires --mount\n\nExample:\n  qrypt probe test %s --mount cloud --count 50 --size 4k", req.Test, req.Test)
 		}
 		if req.Count < 0 || req.Count > contracttest.MaxBatchTestCount {
 			return fmt.Errorf("%s test --count must be between 1 and %d", req.Test, contracttest.MaxBatchTestCount)
@@ -241,10 +270,10 @@ func ValidateDriverTestRequest(req contracttest.DriverTestRequest) error {
 		}
 	case "xfer":
 		if req.Mount != "" || req.Count != 0 {
-			return fmt.Errorf("xfer test uses --source and --dest, not --mount\n\nExample:\n  qrypt debug test xfer --source local --dest cloud --socket /tmp/qrypt.sock")
+			return fmt.Errorf("xfer test uses --source and --dest, not --mount\n\nExample:\n  qrypt probe test xfer --source local --dest cloud")
 		}
 		if req.Source == "" || req.Dest == "" {
-			return fmt.Errorf("xfer test requires --source and --dest\n\nExample:\n  qrypt debug test xfer --source local --dest cloud --socket /tmp/qrypt.sock")
+			return fmt.Errorf("xfer test requires --source and --dest\n\nExample:\n  qrypt probe test xfer --source local --dest cloud")
 		}
 		if req.Source == req.Dest {
 			return fmt.Errorf("xfer test requires different source and dest mounts")

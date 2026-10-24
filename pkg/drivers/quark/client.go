@@ -50,6 +50,7 @@ type client struct {
 	ossSem          chan struct{}
 	onCookieUpdate  func(cookie string)
 	metrics         *driverutil.Buffer
+	wgKeys          map[int]string
 }
 
 func newClient(cookie string, opts clientOptions) *client {
@@ -78,12 +79,14 @@ func newClient(cookie string, opts clientOptions) *client {
 		metaSem:         make(chan struct{}, 500),
 		ossSem:          make(chan struct{}, ossMaxConcurrent),
 		metrics:         driverutil.NewBuffer(500),
+		wgKeys:          opts.WGKeys,
 	}
 }
 
 type clientOptions struct {
 	BaseURL string
 	V2URL   string
+	WGKeys  map[int]string
 }
 
 func newHTTPClient(timeout time.Duration) *http.Client {
@@ -182,6 +185,18 @@ func retryableHTTPStatus(code int) bool {
 	return code == http.StatusTooManyRequests || code >= 500
 }
 
+// isWGResponse reports whether a response body is wg-encrypted. The marker is
+// either the client's own X-U-Content-Encoding header or a Content-Encoding of
+// "wg".
+func isWGResponse(header http.Header) bool {
+	for _, key := range []string{"X-U-Content-Encoding", "Content-Encoding"} {
+		if strings.EqualFold(strings.TrimSpace(header.Get(key)), "wg") {
+			return true
+		}
+	}
+	return false
+}
+
 func shouldRetryWithAltBase(err error) bool {
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
@@ -261,8 +276,14 @@ func (c *client) doRequest(ctx context.Context, method, baseURL, path string, qu
 	sem <- struct{}{}
 	defer func() { <-sem }()
 
+	encodedBody, isWG, err := encodeBody(body, c.wgKeys)
+	if err != nil {
+		return err
+	}
+	metricsBody := metricBody(body)
+
 	for attempt := 0; attempt <= httpMaxRetries; attempt++ {
-		req, err := httpclient.NewJSONRequest(ctx, method, u.String(), body)
+		req, err := httpclient.NewRawRequest(ctx, method, u.String(), encodedBody)
 		if err != nil {
 			return fmt.Errorf("create request failed: %w", err)
 		}
@@ -275,6 +296,9 @@ func (c *client) doRequest(ctx context.Context, method, baseURL, path string, qu
 		req.Header.Set("Referer", defaultReferer)
 		req.Header.Set("User-Agent", defaultUserAgent)
 		req.Header.Set("Accept", "application/json, text/plain, */*")
+		if isWG {
+			req.Header.Set("X-U-Content-Encoding", "wg")
+		}
 
 		httpStart := time.Now()
 		resp, err := c.httpClient.Do(req)
@@ -286,7 +310,7 @@ func (c *client) doRequest(ctx context.Context, method, baseURL, path string, qu
 				Duration:  time.Since(httpStart).String(),
 				Attempt:   attempt + 1,
 				Retry:     attempt > 0,
-				Request:   driverutil.MergeRequest(driverutil.RequestFields(query), driverutil.BodyFields(body)),
+				Request:   driverutil.MergeRequest(driverutil.RequestFields(query), driverutil.BodyFields(metricsBody)),
 				Error:     err.Error(),
 			})
 			if attempt < httpMaxRetries && retryableHTTPError(err) {
@@ -300,6 +324,13 @@ func (c *client) doRequest(ctx context.Context, method, baseURL, path string, qu
 		}
 
 		bodyBytes, readErr := httpclient.ReadBody(resp)
+		if readErr == nil && isWGResponse(resp.Header) {
+			decoded, decryptErr := wgDecrypt(string(bodyBytes), c.wgKeys)
+			if decryptErr != nil {
+				return fmt.Errorf("decrypt wg response failed: %w", decryptErr)
+			}
+			bodyBytes = decoded
+		}
 		if readErr != nil {
 			c.recordMetric(ctx, drive.MetricEvent{
 				Operation: path,
@@ -309,7 +340,7 @@ func (c *client) doRequest(ctx context.Context, method, baseURL, path string, qu
 				Duration:  time.Since(httpStart).String(),
 				Attempt:   attempt + 1,
 				Retry:     attempt > 0,
-				Request:   driverutil.MergeRequest(driverutil.RequestFields(query), driverutil.BodyFields(body)),
+				Request:   driverutil.MergeRequest(driverutil.RequestFields(query), driverutil.BodyFields(metricsBody)),
 				Error:     readErr.Error(),
 			})
 			return fmt.Errorf("read response failed: %w", readErr)
@@ -322,7 +353,7 @@ func (c *client) doRequest(ctx context.Context, method, baseURL, path string, qu
 			Duration:  time.Since(httpStart).String(),
 			Attempt:   attempt + 1,
 			Retry:     attempt > 0,
-			Request:   driverutil.MergeRequest(driverutil.RequestFields(query), driverutil.BodyFields(body)),
+			Request:   driverutil.MergeRequest(driverutil.RequestFields(query), driverutil.BodyFields(metricsBody)),
 			Response:  map[string]any{"bytes": len(bodyBytes)},
 		}
 		for _, cookie := range resp.Cookies() {

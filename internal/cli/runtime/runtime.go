@@ -10,12 +10,14 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"github.com/yinzhenyu/qrypt/internal/cli/i18n"
 	"github.com/yinzhenyu/qrypt/pkg/config"
 	"github.com/yinzhenyu/qrypt/pkg/drive"
 	"github.com/yinzhenyu/qrypt/pkg/mount"
+	"github.com/yinzhenyu/qrypt/pkg/task"
 	"github.com/yinzhenyu/qrypt/pkg/util"
 	"github.com/yinzhenyu/qrypt/pkg/vfs"
-	"github.com/yinzhenyu/qrypt/pkg/vfs/diagnostics"
 )
 
 type ConfigState struct {
@@ -29,7 +31,7 @@ const (
 )
 
 // OpenedFileSystem is the surface OpenFileSystem returns. The one-shot fs
-// commands need file operations plus upload inspection and debug snapshots
+// commands need file operations plus upload inspection and task state
 // (idle-wait, pending uploads, activity counts), so the seam carries them
 // typed instead of re-discovering them via any-assertions. The filesystem is
 // already Started when a caller receives it; the returned cleanup function
@@ -37,7 +39,7 @@ const (
 type OpenedFileSystem interface {
 	vfs.FileSystem
 	vfs.UploadInspector
-	diagnostics.DebugSnapshotProvider
+	TaskSource() task.Source
 }
 
 // MountFileSystem is a built-but-not-started filesystem. The mount command
@@ -48,11 +50,19 @@ type MountFileSystem interface {
 	vfs.Lifecycle
 }
 
+// CoreHost is the application runtime owned by a long-lived command such as
+// mount. Keeping the Core boundary here lets the CLI reuse its lifecycle and
+// task services without exposing pkg/core implementation details to command
+// packages.
+type CoreHost interface {
+	FileSystem() vfs.FileSystem
+	Close(context.Context) error
+}
+
 // ErrorFactory shapes usage, exit, and debug-socket errors for commands.
 type ErrorFactory interface {
 	UsageError(cmd *cobra.Command, format string, args ...any) error
 	ExitError(code int, err error) error
-	MissingSocketError(cmd *cobra.Command) error
 }
 
 // FlagRegistrar wires the cobra flags that command subpackages share.
@@ -72,6 +82,7 @@ type DebugReporter interface {
 // FileSystemBuilder builds or opens the filesystem and resolves config.
 type FileSystemBuilder interface {
 	BuildFileSystemForMount(ctx context.Context, cfg *config.Config, mountName string) (MountFileSystem, func(), error)
+	OpenCoreForMount(ctx context.Context, cfg *config.Config, configPath, mountName, debugListen, controlListen string) (CoreHost, error)
 	CommandConfig(cmd *cobra.Command) (ConfigState, error)
 	CommandConfigPath(cmd *cobra.Command) (string, error)
 	ConfigNotFoundError() error
@@ -103,7 +114,11 @@ func CommandGroupArgs(rt ErrorFactory, hints map[string]string) cobra.Positional
 		if hint := hints[args[0]]; hint != "" {
 			return rt.UsageError(cmd, "%s", hint)
 		}
-		return rt.UsageError(cmd, "unknown command %q for %q\n\nRun '%s --help' to see available commands.", args[0], cmd.CommandPath(), cmd.CommandPath())
+		message := fmt.Sprintf("unknown command %q for %q", args[0], cmd.CommandPath())
+		if suggestions := cmd.SuggestionsFor(args[0]); len(suggestions) > 0 {
+			message += "\n\nDid you mean this?\n\t" + strings.Join(suggestions, "\n\t")
+		}
+		return rt.UsageError(cmd, "%s", message)
 	}
 }
 
@@ -153,6 +168,38 @@ func ExactNamedArgs(rt ErrorFactory, names ...string) cobra.PositionalArgs {
 
 func NoFileCompletions(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
 	return nil, cobra.ShellCompDirectiveNoFileComp
+}
+
+// helpGroupAnnotation tags a flag with its help group. Only the advanced group
+// is meaningful today: those flags are hidden from the default help and revealed
+// by the deep-help form.
+const helpGroupAnnotation = "qrypt.io/help-group"
+
+// MarkAdvancedFlag hides a flag from the default help. The flag still works when
+// passed; the deep-help form (`--advanced`) reveals it alongside the common
+// flags.
+func MarkAdvancedFlag(flag *pflag.Flag) {
+	if flag == nil {
+		return
+	}
+	if flag.Annotations == nil {
+		flag.Annotations = map[string][]string{}
+	}
+	flag.Annotations[helpGroupAnnotation] = []string{"advanced"}
+	flag.Hidden = true
+}
+
+// IsAdvancedFlag reports whether a flag was marked advanced.
+func IsAdvancedFlag(flag *pflag.Flag) bool {
+	if flag == nil {
+		return false
+	}
+	for _, group := range flag.Annotations[helpGroupAnnotation] {
+		if group == "advanced" {
+			return true
+		}
+	}
+	return false
 }
 
 func NonNegativeIntFlag(cmd *cobra.Command, name string) (int, error) {
@@ -208,18 +255,18 @@ func CommandWaitTimeout(cmd *cobra.Command) time.Duration {
 	return timeout
 }
 
-func PrintEntryStat(w io.Writer, entry drive.Entry) {
+func PrintEntryStat(w io.Writer, loc *i18n.Localizer, entry drive.Entry) {
 	kind := "file"
 	if entry.IsDir {
 		kind = "dir"
 	}
-	fmt.Fprintf(w, "type: %s\n", kind)
-	fmt.Fprintf(w, "name: %s\n", entry.Name)
-	fmt.Fprintf(w, "id: %s\n", entry.ID)
-	fmt.Fprintf(w, "parent_id: %s\n", entry.ParentID)
-	fmt.Fprintf(w, "size: %d\n", entry.Size)
+	fmt.Fprintln(w, loc.T("out.fs.stat.type", kind))
+	fmt.Fprintln(w, loc.T("out.fs.stat.name", entry.Name))
+	fmt.Fprintln(w, loc.T("out.fs.stat.id", entry.ID))
+	fmt.Fprintln(w, loc.T("out.fs.stat.parent_id", entry.ParentID))
+	fmt.Fprintln(w, loc.T("out.fs.stat.size", entry.Size))
 	if !entry.ModTime.IsZero() {
-		fmt.Fprintf(w, "mod_time: %s\n", entry.ModTime.Format(time.RFC3339))
+		fmt.Fprintln(w, loc.T("out.fs.stat.mod_time", entry.ModTime.Format(time.RFC3339)))
 	}
 }
 

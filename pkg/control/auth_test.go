@@ -40,7 +40,7 @@ func (s *authResetSnapshotter) DebugReset(context.Context) error {
 func TestTCPServerAuthenticatesBeforeDispatch(t *testing.T) {
 	const token = "test-debug-token-at-least-32-characters"
 	source := &authResetSnapshotter{}
-	server, err := NewServer("127.0.0.1:0", source)
+	server, err := NewProbeServer("127.0.0.1:0", source)
 	if err != nil {
 		t.Fatal(err)
 	}

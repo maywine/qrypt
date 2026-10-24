@@ -2,6 +2,7 @@ package vfs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/yinzhenyu/qrypt/pkg/drive"
 	"github.com/yinzhenyu/qrypt/pkg/logging"
@@ -17,6 +18,8 @@ import (
 // --- staging_write.go ---
 
 func (v *VFS) Create(ctx context.Context, path string) (err error) {
+	v.subtreeMu.RLock()
+	defer v.subtreeMu.RUnlock()
 	defer func() { v.recordHealthResult(drive.HealthOpCreate, err) }()
 	if err := newVFSDriverRuntime(v.driver, v.testEnabled).RequireCapability(drive.CapabilitySourceUploader, "upload"); err != nil {
 		return err
@@ -28,10 +31,10 @@ func (v *VFS) Create(ctx context.Context, path string) (err error) {
 }
 
 func (v *VFS) createLocked(ctx context.Context, path string) error {
-	return v.createLockedWithStore(ctx, path, v.uploads.Store(), newVFSUploadWriteHashTracker(v.hashes, v.driver))
+	return v.createLockedWithStore(ctx, path, v.uploads, newVFSUploadWriteHashTracker(v.uploads, v.driver))
 }
 
-func (v *VFS) createLockedWithStore(ctx context.Context, path string, store *uploadStore, hashes vfsUploadWriteHashTracker) error {
+func (v *VFS) createLockedWithStore(ctx context.Context, path string, store *upload.Domain, hashes vfsUploadWriteHashTracker) error {
 	path = vfstypes.CleanVirtualPath(path)
 	v.restoreDeletedAncestor(pathpkg.Dir(path))
 	v.cancelDeletedFile(path)
@@ -40,7 +43,7 @@ func (v *VFS) createLockedWithStore(ctx context.Context, path string, store *upl
 		return err
 	}
 	v.unhideCopyChild(pathpkg.Dir(path), name)
-	old, hadOld := store.UploadByPath(path)
+	old, hadOld := store.PendingByPath(path)
 	fid := upload.NewStagingFID(path)
 	localPath, err := store.CreateStaging(fid)
 	if err != nil {
@@ -48,7 +51,7 @@ func (v *VFS) createLockedWithStore(ctx context.Context, path string, store *upl
 	}
 	now := util.Now()
 	pending := PendingUpload{Path: path, FID: fid, ParentID: parent.ID, Name: name, LocalPath: localPath, ModTime: now.UnixNano()}
-	if err := store.SaveUpload(pending); err != nil {
+	if err := store.SavePending(pending); err != nil {
 		_ = store.RemoveStaging(localPath)
 		return err
 	}
@@ -70,10 +73,10 @@ func (v *VFS) createLockedWithStore(ctx context.Context, path string, store *upl
 // Parent/Name are reused from the old pending because the path already went
 // through createLocked once.
 func (v *VFS) rotateFrozenGeneration(path string, old PendingUpload) (PendingUpload, error) {
-	return v.rotateFrozenGenerationWithStore(path, old, v.uploads.Store())
+	return v.rotateFrozenGenerationWithStore(path, old, v.uploads)
 }
 
-func (v *VFS) rotateFrozenGenerationWithStore(path string, old PendingUpload, store *uploadStore) (PendingUpload, error) {
+func (v *VFS) rotateFrozenGenerationWithStore(path string, old PendingUpload, store *upload.Domain) (PendingUpload, error) {
 	fid := upload.NewStagingFID(path)
 	localPath, err := store.CreateStaging(fid)
 	if err != nil {
@@ -96,12 +99,35 @@ func (v *VFS) rotateFrozenGenerationWithStore(path string, old PendingUpload, st
 	now := util.Now()
 	pending.Size = size
 	pending.ModTime = now.UnixNano()
-	if err := store.SaveUpload(pending); err != nil {
+	if err := store.SavePending(pending); err != nil {
 		_ = store.RemoveStaging(localPath)
 		return PendingUpload{}, err
 	}
 	v.setLocalModTime(path, now)
 	return pending, nil
+}
+
+// appendsToFrozenGeneration reports whether a write can land in the frozen
+// generation in place instead of rotating to a fresh staging file.
+//
+// A claimed generation is read through drive.NewLocalReadOnlyFileSourceWithHashes,
+// which binds the source to (path, size), so the upload publishes exactly the
+// bytes below that size and never reads past it. Bytes written at or beyond the
+// claimed size therefore cannot reach the in-flight upload, and copying the
+// whole file to protect a prefix that nobody reads is pure waste: a large append
+// that outlives one upload quiet window would otherwise rewrite the file once
+// per upload cycle. Anything below the frozen size still rotates, because those
+// bytes are the ones being published.
+//
+// A recorded replacement candidate keeps the conservative path: the candidate
+// holds the frozen generation's bytes, and a switch that is already under way
+// must not see the staging file it was built from grow underneath it.
+func appendsToFrozenGeneration(pending PendingUpload, off int64, n int) bool {
+	return pending.Frozen &&
+		pending.UploadStarted &&
+		pending.ReplaceUpload == nil &&
+		n > 0 &&
+		off >= pending.Size
 }
 
 // writeTarget returns the pending generation a write must land in. A frozen
@@ -113,24 +139,68 @@ func (v *VFS) rotateFrozenGenerationWithStore(path string, old PendingUpload, st
 // chunks, flush per round): 16 rounds wrote 8.5x and 64 rounds 32.5x the
 // logical bytes, both rotating every time. Once an upload has claimed the
 // generation, the write rotates to a new file exactly as it did before.
-func (v *VFS) writeTarget(store *uploadStore, path string, pending PendingUpload) (PendingUpload, error) {
-	if reused, ok := store.TryReuseFrozenStaging(pending); ok {
+func (v *VFS) writeTarget(store *upload.Domain, path string, pending PendingUpload) (PendingUpload, error) {
+	if reused, ok := store.TryReuseFrozen(pending); ok {
 		logging.L.DebugfEvery("vfs.reuse_frozen_staging", time.Second, "[VFS] reuse frozen staging generation op_id=%q path=%q size=%d local=%q", reused.FID, path, reused.Size, reused.LocalPath)
 		return reused, nil
 	}
-	return v.rotateFrozenGenerationWithStore(path, pending, store)
+	// The copy is the only whole-file cost left in the write path, so make it
+	// countable: reason says which refusal forced it, and the running totals let
+	// a session be judged by the last line instead of by grepping every event.
+	// The line is rate limited because a burst of copies is already a
+	// pathological I/O pattern and the counters are cumulative, so a suppressed
+	// event is still accounted for by the next line.
+	reason := frozenCopyReason(pending)
+	started := time.Now()
+	next, err := v.rotateFrozenGenerationWithStore(path, pending, store)
+	elapsed := time.Since(started).Round(time.Microsecond)
+	if err != nil {
+		logging.L.WarnfEvery("vfs.frozen_copy_failed", time.Second, "[VFS] frozen generation copy failed op_id=%q path=%q reason=%s size=%d duration=%s err=%v", pending.FID, path, reason, pending.Size, elapsed, err)
+		return next, err
+	}
+	copied := pending.Size
+	copies := v.stagingCopies.Add(1)
+	total := v.stagingCopyBytes.Add(uint64(copied))
+	logging.L.InfofEvery("vfs.frozen_copy", time.Second, "[VFS] frozen generation copied op_id=%q path=%q reason=%s bytes=%d duration=%s copies=%d bytes_total=%d", pending.FID, path, reason, copied, elapsed, copies, total)
+	return next, nil
+}
+
+// frozenCopyReason names why TryReuseFrozenStaging refused to revive the
+// generation in place. It mirrors that method's conditions so the log stays
+// accurate without widening the store API: a refusal it does not model (the
+// record moved on between the caller's read and the lookup) falls through to
+// record_moved.
+func frozenCopyReason(pending PendingUpload) string {
+	switch {
+	case pending.ReplaceUpload != nil:
+		return "replacement_candidate"
+	case pending.PermanentFail:
+		return "permanent_failure"
+	case pending.UploadStarted:
+		return "claimed"
+	case !pending.Frozen:
+		return "unfrozen"
+	default:
+		return "record_moved"
+	}
 }
 
 func (v *VFS) WriteAt(ctx context.Context, path string, data []byte, off int64) (n int, err error) {
+	v.subtreeMu.RLock()
+	defer v.subtreeMu.RUnlock()
 	defer func() { v.recordHealthResult(drive.HealthOpWrite, err) }()
 	path = vfstypes.CleanVirtualPath(path)
 	unlock := v.lockPath(path)
 	defer unlock()
-	store := v.uploads.Store()
-	hashes := newVFSUploadWriteHashTracker(v.hashes, v.driver)
+	store := v.uploads
+	hashes := newVFSUploadWriteHashTracker(v.uploads, v.driver)
 	pending, err := pendingUploadFromWriteStore(store, path)
 	if err != nil {
-		if entry, resolveErr := v.resolve(ctx, path); resolveErr == nil && !entry.IsDir {
+		entry, exists, resolveErr := v.existingFileForWrite(ctx, path)
+		if resolveErr != nil {
+			return 0, resolveErr
+		}
+		if exists {
 			v.invalidateReadCache(entry)
 			logging.L.InfofEvery("vfs.stage_existing_for_write", time.Second, "[VFS] staging existing file for write path=%q id=%q size=%d", path, entry.ID, entry.Size)
 			if err := v.stageExisting(ctx, path); err != nil {
@@ -146,11 +216,13 @@ func (v *VFS) WriteAt(ctx context.Context, path string, data []byte, off int64) 
 			return 0, err
 		}
 	}
-	if pending.Frozen {
+	if pending.Frozen && !appendsToFrozenGeneration(pending, off, len(data)) {
 		pending, err = v.writeTarget(store, path, pending)
 		if err != nil {
 			return 0, err
 		}
+	} else if pending.Frozen {
+		logging.L.DebugfEvery("vfs.append_frozen_generation", time.Second, "[VFS] append past claimed generation op_id=%q path=%q off=%d len=%d claimed=%d", pending.FID, path, off, len(data), pending.Size)
 	}
 	n, err = store.WriteStagingAt(pending.LocalPath, data, off)
 	if err != nil {
@@ -162,18 +234,20 @@ func (v *VFS) WriteAt(ctx context.Context, path string, data []byte, off int64) 
 	}
 	now := util.Now()
 	pending.ModTime = now.UnixNano()
-	store.UpdateUploadTransient(pending)
+	store.UpdatePendingTransient(pending)
 	v.setLocalModTime(path, now)
 	logging.L.DebugfEvery("vfs.write_staged", time.Second, "[VFS] write staged op_id=%q path=%q off=%d len=%d written=%d size=%d local=%q", pending.FID, path, off, len(data), n, pending.Size, pending.LocalPath)
 	return n, nil
 }
 
 func (v *VFS) Flush(ctx context.Context, path string) (err error) {
+	v.subtreeMu.RLock()
+	defer v.subtreeMu.RUnlock()
 	defer func() { v.recordHealthResult(drive.HealthOpWrite, err) }()
 	path = vfstypes.CleanVirtualPath(path)
 	unlock := v.lockPath(path)
 	defer unlock()
-	store := v.uploads.Store()
+	store := v.uploads
 	pending, err := pendingUploadFromWriteStore(store, path)
 	if err != nil {
 		logging.L.DebugfEvery("vfs.flush_ignored", time.Second, "[VFS] flush ignored without pending path=%q", path)
@@ -187,7 +261,7 @@ func (v *VFS) Flush(ctx context.Context, path string) (err error) {
 		return err
 	}
 	pending.Size = size
-	if sourceHashes, ok := v.hashes.Snapshot(pending, requiredUploadSnapshotHashes(v.driver)); ok {
+	if sourceHashes, ok := v.uploads.SnapshotHashes(pending, requiredUploadSnapshotHashes(v.driver)); ok {
 		pending.SourceHashes = sourceHashes
 	}
 	pending.Frozen = true
@@ -196,10 +270,10 @@ func (v *VFS) Flush(ctx context.Context, path string) (err error) {
 		pending.ModTime = now.UnixNano()
 		v.setLocalModTime(path, now)
 	}
-	if err := store.SaveUpload(pending); err != nil {
+	if err := store.SavePending(pending); err != nil {
 		return err
 	}
-	if latest, ok := store.UploadByPath(path); ok {
+	if latest, ok := store.PendingByPath(path); ok {
 		pending = latest
 	}
 	delay := v.uploads.DefaultDelay()
@@ -215,6 +289,8 @@ func (v *VFS) Flush(ctx context.Context, path string) (err error) {
 }
 
 func (v *VFS) Truncate(ctx context.Context, path string, size int64) (err error) {
+	v.subtreeMu.RLock()
+	defer v.subtreeMu.RUnlock()
 	defer func() { v.recordHealthResult(drive.HealthOpWrite, err) }()
 	if size < 0 {
 		return fmt.Errorf("vfs: truncate size must be non-negative")
@@ -222,8 +298,8 @@ func (v *VFS) Truncate(ctx context.Context, path string, size int64) (err error)
 	path = vfstypes.CleanVirtualPath(path)
 	unlock := v.lockPath(path)
 	defer unlock()
-	store := v.uploads.Store()
-	hashes := newVFSUploadWriteHashTracker(v.hashes, v.driver)
+	store := v.uploads
+	hashes := newVFSUploadWriteHashTracker(v.uploads, v.driver)
 	pending, err := pendingUploadFromWriteStore(store, path)
 	if err != nil {
 		if err := v.stageExisting(ctx, path); err != nil {
@@ -251,18 +327,37 @@ func (v *VFS) Truncate(ctx context.Context, path string, size int64) (err error)
 	if entry, err := v.resolve(ctx, path); err == nil && !entry.IsDir {
 		v.invalidateReadCache(entry)
 	}
-	return store.SaveUpload(pending)
+	return store.SavePending(pending)
+}
+
+// existingFileForWrite reports whether path currently resolves to a regular
+// file that a write must stage before modifying. Only a definitive NotFound
+// means "does not exist": every other resolve error is returned unchanged so a
+// transient listing failure can never replace remote content with an empty
+// staging file. A directory is rejected with ErrIsDir.
+func (v *VFS) existingFileForWrite(ctx context.Context, path string) (drive.Entry, bool, error) {
+	entry, err := v.resolve(ctx, path)
+	if err != nil {
+		if errors.Is(err, drive.ErrNotFound) {
+			return drive.Entry{}, false, nil
+		}
+		return drive.Entry{}, false, err
+	}
+	if entry.IsDir {
+		return drive.Entry{}, false, fmt.Errorf("%w: %s", ErrIsDir, path)
+	}
+	return entry, true, nil
 }
 
 func (v *VFS) stageExisting(ctx context.Context, path string) error {
-	return v.stageExistingWithStore(ctx, path, v.uploads.Store())
+	return v.stageExistingWithStore(ctx, path, v.uploads)
 }
 
-func (v *VFS) stageExistingWithStore(ctx context.Context, path string, store *uploadStore) error {
+func (v *VFS) stageExistingWithStore(ctx context.Context, path string, store *upload.Domain) error {
 	return v.stageExistingWithDeps(ctx, path, store, newVFSUploadWriteRemote(v))
 }
 
-func (v *VFS) stageExistingWithDeps(ctx context.Context, path string, store *uploadStore, remote uploadWriteRemote) error {
+func (v *VFS) stageExistingWithDeps(ctx context.Context, path string, store *upload.Domain, remote uploadWriteRemote) error {
 	parent, name, err := remote.Parent(ctx, path)
 	if err != nil {
 		return err
@@ -291,7 +386,18 @@ func (v *VFS) stageExistingWithDeps(ctx context.Context, path string, store *upl
 		Name:      name,
 		LocalPath: localPath,
 	}
-	if entry, err := remote.Resolve(ctx, path); err == nil && !entry.IsDir {
+	entry, resolveErr := remote.Resolve(ctx, path)
+	switch {
+	case resolveErr == nil && entry.IsDir:
+		dropStaging()
+		return fmt.Errorf("%w: %s", ErrIsDir, path)
+	case resolveErr != nil && !errors.Is(resolveErr, drive.ErrNotFound):
+		// A transient resolve/list failure does not prove the remote file is
+		// gone. Treat it as an error so the caller cannot upload an empty or
+		// partial staging file over the existing content.
+		dropStaging()
+		return resolveErr
+	case resolveErr == nil:
 		if !entry.ModTime.IsZero() {
 			modTime = entry.ModTime
 		}
@@ -327,7 +433,7 @@ func (v *VFS) stageExistingWithDeps(ctx context.Context, path string, store *upl
 	}
 	pending.Size = size
 	pending.ModTime = modTime.UnixNano()
-	if err := store.SaveUpload(pending); err != nil {
+	if err := store.SavePending(pending); err != nil {
 		dropStaging()
 		return err
 	}
@@ -344,9 +450,9 @@ func (v *VFS) stageExistingWithDeps(ctx context.Context, path string, store *upl
 // fed, so after a crash the safe "no hashes, hash the file" path still applies.
 func (v *VFS) stagingHashFeed(pending PendingUpload) func(chunk []byte, off int64) {
 	algorithms := requiredUploadSnapshotHashes(v.driver)
-	v.hashes.Start(pending, algorithms)
+	v.uploads.StartHashes(pending, algorithms)
 	return func(chunk []byte, off int64) {
-		v.hashes.Write(pending, chunk, off, algorithms)
+		v.uploads.WriteHashes(pending, chunk, off, algorithms)
 	}
 }
 
@@ -358,7 +464,7 @@ func (v *VFS) SetModTime(ctx context.Context, path string, modTime time.Time) (e
 	}
 	unlock := v.lockPath(path)
 	defer unlock()
-	store := v.uploads.Store()
+	store := v.uploads
 	if _, err := pendingUploadFromWriteStore(store, path); err == nil {
 		v.setLocalModTime(path, modTime)
 		return nil
