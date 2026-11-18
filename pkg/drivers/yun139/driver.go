@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,15 +31,27 @@ type partMeta struct {
 const (
 	uploadPartConcurrency = 1
 	quotaSizeUnit         = util.MiB
+	// Upload parts are 100 MiB (512 MiB above 30 GiB), far larger than the
+	// 60-second API timeout allows on a slow uplink. Each part request gets a
+	// size-derived budget and an idle watchdog instead.
+	yun139UploadIdleTimeout = 2 * time.Minute
+	yun139UploadMinRate     = int64(256 << 10) // bytes per second
+	yun139UploadMinTimeout  = 2 * time.Minute
+	yun139UploadMaxTimeout  = time.Hour
 )
 
 type Driver struct {
 	drive.UnsupportedOperations
-	cl                  *client
-	rootID              string
-	rootPath            string
-	limiter             *drive.BandwidthLimiter
-	stateStore          drive.StateStore
+	cl         *client
+	rootID     string
+	rootPath   string
+	limiter    *drive.BandwidthLimiter
+	stateStore drive.StateStore
+	// cred owns the shared-session lifecycle for mounts that reference a
+	// [[credentials]] entry; no installed session keeps the per-mount state
+	// store behaviour.
+	cred                *driverutil.CredentialBinding[credentialPayload]
+	credOnce            sync.Once
 	authSource          string
 	authUpdated         time.Time
 	configAuthorization string
@@ -86,16 +99,43 @@ func New(authorization, rootPath, rootID string) *Driver {
 		authSource:          "config",
 	}
 	d.cl.onAuthorizationUpdate = d.saveUpdatedAuthorization
+	d.cl.onAuthRecovery = d.recoverCredential
+	d.cl.onAuthFallback = d.recoverStaticAuthorization
+	d.cred = newCredentialBinding(d)
 	return d
 }
 
+// newCredentialBinding wires the shared-session binding to this driver.
+func newCredentialBinding(d *Driver) *driverutil.CredentialBinding[credentialPayload] {
+	return driverutil.NewCredentialBinding("139", decodeCredentialPayload, d.applyCredentialBinding)
+}
+
+// credentialBinding returns the shared-session binding, creating it for
+// drivers built without New (tests construct Driver literals).
+func (d *Driver) credentialBinding() *driverutil.CredentialBinding[credentialPayload] {
+	d.credOnce.Do(func() {
+		if d.cred == nil {
+			d.cred = newCredentialBinding(d)
+		}
+	})
+	return d.cred
+}
+
 func (d *Driver) Init(ctx context.Context) error {
-	d.loadAuthState()
+	if d.credentialBinding().Session() != nil {
+		d.loadCredentialSession()
+		d.subscribeCredentialSession()
+	} else {
+		d.loadAuthState()
+	}
 	if _, _, err := d.cl.decodeAuth(); err != nil {
 		return fmt.Errorf("139: invalid authorization: %w", err)
 	}
 	if err := d.cl.refreshTokenIfNeeded(ctx); err != nil {
 		return fmt.Errorf("139: refresh authorization: %w", err)
+	}
+	if cred := d.credentialBinding(); cred.Session() != nil && len(cred.Snapshot().Payload) == 0 {
+		d.commitCredentialAuthorization(d.cl.getAuthorization())
 	}
 	if err := d.cl.ensurePersonalCloudHost(); err != nil {
 		return fmt.Errorf("139: resolve host: %w", err)
@@ -114,6 +154,7 @@ func (d *Driver) Init(ctx context.Context) error {
 }
 
 func (d *Driver) Drop(ctx context.Context) error {
+	d.credentialBinding().Close()
 	d.sessionStoreMu.Lock()
 	if d.sessionCancel != nil {
 		d.sessionCancel()
@@ -129,6 +170,12 @@ func (d *Driver) Drop(ctx context.Context) error {
 func (d *Driver) InstallStateStore(store drive.StateStore) {
 	d.stateStore = store
 	d.installSessionIndex(store)
+}
+
+// InstallCredentialSession lets every mount of one configured 139 credential
+// share a single refreshed authorization.
+func (d *Driver) InstallCredentialSession(session drive.CredentialSession) {
+	d.credentialBinding().Install(session)
 }
 
 func (d *Driver) InstallBandwidthLimiter(limiter *drive.BandwidthLimiter) drive.BandwidthLimitDirection {
@@ -171,6 +218,10 @@ func (d *Driver) saveUpdatedAuthorization(authorization string) {
 	if authorization == "" {
 		return
 	}
+	if d.credentialBinding().Session() != nil {
+		d.commitCredentialAuthorization(authorization)
+		return
+	}
 	d.authSource = "refresh"
 	d.authUpdated = time.Now()
 	if d.stateStore == nil {
@@ -181,6 +232,75 @@ func (d *Driver) saveUpdatedAuthorization(authorization string) {
 		ConfigAuthorization: d.configAuthorization,
 		UpdatedAt:           d.authUpdated,
 	})
+}
+
+// recoverCredential adopts a newer shared authorization after an auth failure.
+func (d *Driver) recoverCredential() bool {
+	return d.credentialBinding().Recover()
+}
+
+// recoverStaticAuthorization falls back to the configured authorization after
+// both the shared session and the refresh flow fail.
+func (d *Driver) recoverStaticAuthorization() bool {
+	if d.configAuthorization == "" || d.configAuthorization == d.cl.getAuthorization() {
+		return false
+	}
+	d.cl.setAuthorization(d.configAuthorization)
+	d.authSource = "config"
+	return true
+}
+
+// loadCredentialSession adopts the shared session's authorization when this
+// mount starts.
+func (d *Driver) loadCredentialSession() {
+	d.credentialBinding().Load()
+}
+
+// subscribeCredentialSession follows refreshes committed by sibling mounts.
+func (d *Driver) subscribeCredentialSession() {
+	d.credentialBinding().Subscribe()
+}
+
+// applyCredentialBinding applies one decoded payload to the client.
+func (d *Driver) applyCredentialBinding(value credentialPayload, snapshot drive.CredentialSnapshot, source string) bool {
+	if value.Authorization == "" {
+		return false
+	}
+	d.cl.setAuthorization(value.Authorization)
+	d.authSource = source
+	d.authUpdated = snapshot.UpdatedAt
+	return true
+}
+
+func (d *Driver) commitCredentialAuthorization(authorization string) {
+	cred := d.credentialBinding()
+	if cred.Session() == nil || authorization == "" {
+		return
+	}
+	payload, err := encodeCredentialAuthorization(authorization)
+	if err != nil {
+		return
+	}
+	if err := cred.Commit(payload, d.cl.getAccount()); err != nil && !errors.Is(err, drive.ErrCredentialVersionConflict) {
+		logging.L.Warnf("[139] commit shared credential failed: %v", err)
+	}
+}
+
+type credentialPayload struct {
+	Authorization string `json:"authorization"`
+}
+
+func encodeCredentialAuthorization(authorization string) ([]byte, error) {
+	return json.Marshal(credentialPayload{Authorization: authorization})
+}
+
+func decodeCredentialPayload(data []byte) (credentialPayload, error) {
+	var payload credentialPayload
+	if len(data) == 0 {
+		return payload, nil
+	}
+	err := json.Unmarshal(data, &payload)
+	return payload, err
 }
 
 func (d *Driver) setLastError(err error) {
@@ -413,6 +533,13 @@ func (d *Driver) DebugSnapshot(ctx context.Context) (drive.DebugSnapshot, error)
 	if lastError != "" {
 		health = "degraded"
 	}
+	extra := map[string]any{
+		drive.DebugExtraCredentialSource:   d.authSource,
+		drive.DebugExtraCredentialUpdated:  d.authUpdated,
+		drive.DebugExtraLastError:          lastError,
+		drive.DebugExtraInstantUploadCount: instantUploadCount,
+	}
+	d.credentialBinding().Debug(extra)
 	return drive.DebugSnapshot{
 		Driver:      "yun139",
 		Health:      health,
@@ -421,12 +548,7 @@ func (d *Driver) DebugSnapshot(ctx context.Context) (drive.DebugSnapshot, error)
 			drive.DebugStatRootID:   d.rootID,
 			drive.DebugStatRootPath: d.rootPath,
 		},
-		Extra: map[string]any{
-			drive.DebugExtraCredentialSource:   d.authSource,
-			drive.DebugExtraCredentialUpdated:  d.authUpdated,
-			drive.DebugExtraLastError:          lastError,
-			drive.DebugExtraInstantUploadCount: instantUploadCount,
-		},
+		Extra: extra,
 	}, nil
 }
 
@@ -434,11 +556,18 @@ func (d *Driver) metricEvents(ctx context.Context, since time.Time) ([]drive.Met
 	return d.cl.metricEvents(since), nil
 }
 
+// UploadProfile exposes the part size and part concurrency a probe may sweep.
+func (d *Driver) UploadProfile() drive.UploadProfile {
+	return drive.UploadProfile{ChunkSize: calcPartSize(0), Concurrency: uploadPartConcurrency}
+}
+
 func (d *Driver) putSource(ctx context.Context, parentID, name string, source drive.ReadOnlyFileSource, progress drive.UploadProgress) (drive.Entry, error) {
 	size := source.Size()
 	now := time.Now()
 	fileID := d.resolveID(parentID)
 	partSize := calcPartSize(size)
+	partConcurrency := uploadPartConcurrency
+	override, hasOverride := drive.UploadProfileFromContext(ctx)
 
 	drive.ReportUploadPhase(progress, drive.UploadPhaseHashing)
 	sha256Hex, err := sourceSHA256Hex(ctx, source, size)
@@ -464,6 +593,20 @@ func (d *Driver) putSource(ctx context.Context, parentID, name string, source dr
 	partCount := size / partSize
 	if size%partSize > 0 {
 		partCount++
+	}
+	// A measurement override may only reshape a fresh upload: a resumed
+	// session's parts were created with the token's part size.
+	if hasOverride && !resumedSession {
+		if override.ChunkSize > 0 {
+			partSize = override.ChunkSize
+		}
+		if override.Concurrency > 0 {
+			partConcurrency = override.Concurrency
+		}
+		partCount = size / partSize
+		if size%partSize > 0 {
+			partCount++
+		}
 	}
 
 	partInfos := make([]partMeta, partCount)
@@ -553,7 +696,7 @@ func (d *Driver) putSource(ctx context.Context, parentID, name string, source dr
 	// 分片上传：已确认分片跳过（本地确认位图），上传 URL 每次现取。
 	if len(partInfos) > 0 {
 		skipParts := session.ConfirmedParts(token.Confirmed)
-		if err := d.uploadParts(ctx, source, progress, createResp, partInfos, partSize, size, skipParts, func(partNumber int) {
+		if err := d.uploadParts(ctx, source, progress, createResp, partInfos, partSize, partConcurrency, size, skipParts, func(partNumber int) {
 			if d.sessions == nil || sessionKey == "" {
 				return
 			}
@@ -665,7 +808,7 @@ func sourceSHA256Hex(ctx context.Context, source drive.ReadOnlyFileSource, size 
 	return fmt.Sprintf("%X", hasher.Sum(nil)), nil
 }
 
-func (d *Driver) uploadParts(ctx context.Context, source drive.ReadOnlyFileSource, progress drive.UploadProgress, createResp personalUploadResp, partInfos []partMeta, partSize, size int64, completed map[int]bool, markComplete func(int)) error {
+func (d *Driver) uploadParts(ctx context.Context, source drive.ReadOnlyFileSource, progress drive.UploadProgress, createResp personalUploadResp, partInfos []partMeta, partSize int64, partConcurrency int, size int64, completed map[int]bool, markComplete func(int)) error {
 	type uploadPart struct {
 		partNumber int
 		uploadURL  string
@@ -713,7 +856,7 @@ func (d *Driver) uploadParts(ctx context.Context, source drive.ReadOnlyFileSourc
 	}
 
 	g, uploadCtx := errgroup.WithContext(ctx)
-	g.SetLimit(uploadPartConcurrency)
+	g.SetLimit(partConcurrency)
 	for _, up := range uploadParts {
 		up := up
 		g.Go(func() error {
@@ -734,18 +877,26 @@ func (d *Driver) uploadParts(ctx context.Context, source drive.ReadOnlyFileSourc
 			if _, err := f.Seek(start, io.SeekStart); err != nil {
 				return fmt.Errorf("139: upload part %d seek: %w", up.partNumber, err)
 			}
-			body := drive.NewUploadProgressReader(progress, io.LimitReader(f, end-start))
-			body = d.limiter.LimitUpload(uploadCtx, body)
-			req, err := http.NewRequestWithContext(uploadCtx, http.MethodPut, up.uploadURL, body)
+			partLength := end - start
+			partBudget := driverutil.UploadBudget(partLength, yun139UploadMinRate, yun139UploadMinTimeout, yun139UploadMaxTimeout)
+			budgetCtx, cancelBudget := context.WithTimeout(uploadCtx, partBudget)
+			defer cancelBudget()
+			partCtx, cancelPart := context.WithCancelCause(budgetCtx)
+			defer cancelPart(nil)
+			body := drive.NewUploadProgressReader(progress, io.LimitReader(f, partLength))
+			body = d.limiter.LimitUpload(partCtx, body)
+			watchdog := driverutil.NewUploadWatchdog(partCtx, body, yun139UploadIdleTimeout, cancelPart)
+			defer watchdog.Stop()
+			req, err := http.NewRequestWithContext(partCtx, http.MethodPut, up.uploadURL, watchdog)
 			if err != nil {
 				return fmt.Errorf("139: upload part %d: %w", up.partNumber, err)
 			}
-			req.ContentLength = end - start
+			req.ContentLength = partLength
 			req.Header.Set("Content-Type", "application/octet-stream")
 			req.Header.Set("Origin", defaultBaseURL)
 			req.Header.Set("Referer", defaultBaseURL+"/")
 			httpStart := time.Now()
-			resp, err := d.cl.httpClient.Do(req)
+			resp, err := d.cl.uploadClient.Do(req)
 			d.cl.recordMetric(uploadCtx, drive.MetricEvent{
 				Operation: "upload_part",
 				Method:    req.Method,
@@ -756,6 +907,12 @@ func (d *Driver) uploadParts(ctx context.Context, source drive.ReadOnlyFileSourc
 				Error:     errorString(err),
 			})
 			if err != nil {
+				switch {
+				case errors.Is(context.Cause(partCtx), driverutil.ErrUploadStalled):
+					err = fmt.Errorf("no progress for %s: %w", yun139UploadIdleTimeout, driverutil.ErrUploadStalled)
+				case budgetCtx.Err() != nil:
+					err = fmt.Errorf("exceeded %s: %w", partBudget, err)
+				}
 				return fmt.Errorf("139: upload part %d: %w", up.partNumber, err)
 			}
 			resp.Body.Close()

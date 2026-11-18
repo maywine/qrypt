@@ -3,14 +3,24 @@ name: Contract Tests
 # Runs the real-netdisk contract suite against a live `qrypt mount` debug
 # server. Never runs on PRs (real provider credentials are required).
 #
-#   manual:  pick the mounts to exercise
-#   nightly: exercises every mount configured in the variable
+#   manual:  pick the mounts to exercise (no input = every configured mount)
+#   nightly: exercises CONTRACT_NIGHTLY_MOUNTS_JSON only
 #
 # Required configuration (repo/org level):
-#   Secret   CONTRACT_CONFIG_TOML_B64 - base64 of a qrypt.toml with real
-#                                       accounts (never printed; GitHub
-#                                       masks it in logs)
-#   Variable CONTRACT_MOUNTS_JSON     - e.g. ["p115","quark"]
+#   Secret   CONTRACT_CONFIG_TOML_B64      - base64 of a qrypt.toml with real
+#                                            accounts (never printed; GitHub
+#                                            masks it in logs). Contains every
+#                                            mount listed in CONTRACT_MOUNTS_JSON.
+#   Variable CONTRACT_MOUNTS_JSON          - e.g. ["p115","quark"], the full set
+#                                            kept in the secret.
+#   Variable CONTRACT_NIGHTLY_MOUNTS_JSON  - subset safe to run unattended,
+#                                            e.g. ["p115"].
+#
+# Nightly excludes mounts whose credentials only live in rotating per-run
+# session state (quark): a fresh CI runner starts from the static cookie in the
+# config, that cookie ages out within days, and every schedule then fails with
+# the mount missing from the server. Run those with a manual dispatch instead,
+# after refreshing CONTRACT_CONFIG_TOML_B64.
 #
 # The mounts list must be a repository VARIABLE, not a secret: GitHub
 # masks secret-derived job outputs as ***, which breaks fromJson matrix
@@ -35,17 +45,49 @@ permissions:
 jobs:
   setup:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       mounts: ${{ steps.m.outputs.mounts }}
     steps:
       - id: m
         env:
+          EVENT: ${{ github.event_name }}
           INPUT: ${{ inputs.mounts }}
           MOUNTS_VAR: ${{ vars.CONTRACT_MOUNTS_JSON }}
+          NIGHTLY_VAR: ${{ vars.CONTRACT_NIGHTLY_MOUNTS_JSON }}
         run: |
           if [ -n "${INPUT:-}" ]; then
-            json="[\"$(echo "$INPUT" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | paste -sd',' -)\"]"
+            # Manual dispatch: exactly the mounts given on the input.
+            json=$(printf '%s' "$INPUT" |
+              jq -Rc 'split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')
+            if [ "$json" = "[]" ]; then
+              echo "mounts input lists no mount names"
+              exit 1
+            fi
             echo "mounts=$json" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT" = "schedule" ]; then
+            # Scheduled runs are unattended, so only mounts whose credentials
+            # survive between runs belong here; see the header comment.
+            if [ -z "${NIGHTLY_VAR:-}" ]; then
+              echo "schedule needs the CONTRACT_NIGHTLY_MOUNTS_JSON repository variable"
+              exit 1
+            fi
+            MOUNTS_VAR="${MOUNTS_VAR:-[]}" NIGHTLY_VAR="$NIGHTLY_VAR" python3 - <<'PY'
+          import json, os
+          every = json.loads(os.environ["MOUNTS_VAR"] or "[]")
+          nightly = json.loads(os.environ["NIGHTLY_VAR"])
+          if not nightly:
+              raise SystemExit("CONTRACT_NIGHTLY_MOUNTS_JSON must list at least one mount")
+          missing = [m for m in nightly if m not in every]
+          if missing:
+              raise SystemExit(
+                  "CONTRACT_NIGHTLY_MOUNTS_JSON lists mounts missing from "
+                  f"CONTRACT_MOUNTS_JSON: {missing}"
+              )
+          excluded = [m for m in every if m not in nightly]
+          print(f"nightly mounts: {nightly}; excluded, dispatch only: {excluded}")
+          PY
+            echo "mounts=$NIGHTLY_VAR" >> "$GITHUB_OUTPUT"
           elif [ -n "${MOUNTS_VAR:-}" ]; then
             echo "mounts=$MOUNTS_VAR" >> "$GITHUB_OUTPUT"
           else
@@ -56,19 +98,24 @@ jobs:
   contract:
     needs: [setup]
     runs-on: ubuntu-latest
+    # The per-mount suite step is capped at 30 minutes; the rest covers the
+    # build, the mount-server startup wait (120s) and one restart on a
+    # transient init failure.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         mount: ${{ fromJson(needs.setup.outputs.mounts) }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          # go.mod is the single source of truth for the pinned toolchain.
+          go-version-file: go.mod
           cache: true
 
       - name: Install FUSE headers
-        run: sudo apt-get update && sudo apt-get install -y libfuse3-dev fuse3
+        uses: ./.github/actions/setup-fuse
 
       - name: Write contract config
         env:
@@ -106,51 +153,70 @@ jobs:
         env:
           MOUNT: ${{ matrix.mount }}
         run: |
-          # A mount can be skipped at server startup when its init hits a
-          # transient network blip, in which case the suite fails immediately
-          # with `mount "X" not found`. Restart the mount server once so the
-          # mount gets a fresh init attempt before declaring the run failed.
+          # The namespace is built before the debug/control sockets open, so
+          # /v1/health only proves the server is up: it stays OK even when a
+          # mount failed to initialize. Such a mount is dropped from the
+          # namespace (core.buildNamespace logs a warning and continues), and
+          # every later request for it answers `mount "X" not found`.
           #
-          # The probe's status is captured in the `else` branch on purpose: `$?`
-          # read after the whole `if` is always 0 (an `if` whose condition is
-          # false and has no `else` returns 0), which silently turned every
-          # suite failure - including real contract violations - into a green
-          # job.
-          out=$(mktemp)
-          attempts=2
-          rc=1
-          for i in $(seq 1 "$attempts"); do
-            if /tmp/qrypt probe test contract --config ./qrypt.toml --mount "$MOUNT" >"$out" 2>&1; then
-              cat "$out"
-              exit 0
-            else
-              rc=$?
-            fi
-            cat "$out"
-            if [ "$i" -ge "$attempts" ] || ! grep -q "not found" "$out"; then
-              exit "$rc"
-            fi
-            echo "== mount \"$MOUNT\" missing from the server; restarting mount server for a fresh init attempt =="
+          # Check the mount-scoped endpoint instead of probing blind. It is the
+          # only signal that separates "this mount is absent" from "this mount
+          # exists but its provider is unhealthy". A missing mount gets one
+          # server restart so a transient init failure can succeed; a second
+          # miss is an initialization failure (expired credential, rejected
+          # session, ...) that retrying the suite can never fix.
+          mount_present() {
+            local out
+            out=$(/tmp/qrypt debug raw "/v1/mounts/health?mount=${MOUNT}" --config ./qrypt.toml 2>&1) && return 0
+            echo "$out" >&2
+            # Absent mounts answer 502 with `vfs: mount "X" not found`; any
+            # other error means the mount exists and its provider is degraded,
+            # which the suite reports with a proper failure category.
+            ! grep -q "mount \"${MOUNT}\" not found" <<<"$out"
+          }
+          restart_mount_server() {
             pkill -f '^/tmp/qrypt mount' || true
             sleep 2
-            nohup /tmp/qrypt mount --config ./qrypt.toml >/tmp/qrypt-mount.log 2>&1 &
+            # Append: the first attempt's stderr is what explains a failed init.
+            echo "== restarting mount server ==" >>/tmp/qrypt-mount.log
+            nohup /tmp/qrypt mount --config ./qrypt.toml >>/tmp/qrypt-mount.log 2>&1 &
             for _ in $(seq 1 120); do
-              /tmp/qrypt debug raw /v1/health --config ./qrypt.toml >/dev/null 2>&1 && break
+              /tmp/qrypt debug raw /v1/health --config ./qrypt.toml >/dev/null 2>&1 && return 0
               sleep 1
             done
-            if ! /tmp/qrypt debug raw /v1/health --config ./qrypt.toml >/dev/null 2>&1; then
-              echo "mount server did not restart:"
-              cat /tmp/qrypt-mount.log
+            echo "mount server did not restart:"
+            cat /tmp/qrypt-mount.log 2>/dev/null || true
+            return 1
+          }
+          if ! mount_present; then
+            echo "== mount \"$MOUNT\" is missing from the server; restarting once so a transient init failure gets a fresh attempt =="
+            restart_mount_server
+            if ! mount_present; then
+              echo "::error::mount \"$MOUNT\" failed to initialize at startup; see the mount failure dump in the failure step below"
               exit 1
             fi
-          done
-          # Unreachable in practice; the last attempt always exits above.
-          exit "$rc"
+          fi
+          # Run the suite exactly once: its exit code is the job result, and a
+          # real contract violation must never be masked by a retry.
+          /tmp/qrypt probe test contract --config ./qrypt.toml --mount "$MOUNT"
 
       - name: Dump mount server log on failure
         if: failure()
         run: |
-          cat /tmp/qrypt-mount.log
+          echo "== mount server stderr =="
+          cat /tmp/qrypt-mount.log 2>/dev/null || true
+          # Mount init failures (expired session, rejected credential, ...) only
+          # reach the runtime file logger, never the stderr above, so the reason
+          # a mount is absent is otherwise invisible. Print just the per-mount
+          # failure lines: they carry the provider error, not the credentials.
+          while IFS= read -r log; do
+            echo "== mount init failures in $log =="
+            if grep -q -E 'config: mount .* failed' "$log"; then
+              grep -E 'config: mount .* failed' "$log" | tail -n 20
+            else
+              echo "(no mount init failures logged)"
+            fi
+          done < <(find "$HOME" "$RUNNER_TEMP" -maxdepth 5 -name 'qrypt-error.log' 2>/dev/null)
           # Names, types and the test flag only: [[mounts]] params hold real
           # credentials and must never be printed.
           echo "== mounts in the contract config =="

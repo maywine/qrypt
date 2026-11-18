@@ -11,11 +11,13 @@ preserve an accidental dependency.
 cmd/qrypt -> internal/cli -> pkg/core -> pkg/vfs -> pkg/drive
                                       \            ^
                                        -> pkg/task |
+                                       -> pkg/share -> pkg/drive / pkg/task
 
 mobile app -> pkg/mobile -> pkg/core                  pkg/drivers/<name>
 
 pkg/mount -> pkg/vfs
 pkg/control -> diagnostic operations -> pkg/vfs / pkg/drive
+pkg/control -> pkg/share
 pkg/crypt -> pkg/drive
 ```
 
@@ -42,12 +44,14 @@ for those contracts.
 
 | Package | Owns | Must not own |
 | --- | --- | --- |
-| `pkg/drive` | Provider contracts, capabilities, provider-neutral errors and health | Filesystem semantics, concrete providers, UI/runtime policy |
+| `pkg/drive` | Provider contracts, capabilities, provider-neutral errors and health, shared-credential contract | Filesystem semantics, concrete providers, UI/runtime policy |
+| `pkg/core/internal/credentials` | Process-wide credential session lifecycle: versioned commits, persistence, subscriptions, coalesced refresh | Provider protocols, filesystem semantics, client transports |
 | `pkg/drivers/<name>` | One provider's protocol, authentication and provider-specific session state | VFS, mount, control or CLI behavior |
 | `pkg/crypt` | Encryption wrapper implementing drive contracts | VFS cache or application task state |
 | `pkg/vfs` | Provider-independent filesystem facade, namespace routing and assembly of VFS domains | Provider APIs, mobile contracts or platform mount policy |
 | `pkg/vfs/<domain>` | State and transitions for one VFS domain | Cross-domain composition or platform-specific filename policy |
 | `pkg/task` | Generic task state machine, persistence and subscriptions | File-transfer implementations or client transport DTOs |
+| `pkg/share` | Provider-neutral share-link and receive application contract: request/response DTOs, the service interface and secret redaction | Provider protocols, task execution, HTTP transport |
 | `pkg/core` | Stable application facade and runtime composition | Client-specific JSON/gomobile types or provider protocols |
 | `pkg/core/internal/*` | Application services hidden behind `core.Core` | Public entry points that let clients bypass `core.Core` |
 | `pkg/mobile` | Gomobile-safe sessions, handles, callbacks and JSON envelopes | VFS/media/task implementation types or business workflows |

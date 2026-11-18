@@ -40,6 +40,9 @@ type Options struct {
 	UploadDelay   time.Duration
 	UploadWorkers int
 	DeleteDelay   time.Duration
+	// ReadPolicy optionally overrides the driver's read scheduling defaults
+	// for this mount. Nil keeps the driver profile unchanged.
+	Read *drive.ReadOverride
 }
 
 type VFS struct {
@@ -58,6 +61,7 @@ type VFS struct {
 	rootID           string
 	encrypted        bool
 	testEnabled      bool
+	readSource       *drive.ReadSource
 
 	// Domain state is grouped by ownership: each runtime is initialized in
 	// New, mutated only by its domain's code paths, and shut down by the VFS
@@ -75,6 +79,7 @@ type VFS struct {
 	// their domains).
 	activeDebug *observe.ActiveStore
 	faults      *faultinject.Registry
+	readFaults  *faultinject.ReadFaultRegistry
 	pathLocks   *pathlock.State
 	// subtreeMu serializes directory removal (check through view commit)
 	// against mutations that can introduce descendants. Ordinary writes take
@@ -150,6 +155,11 @@ func New(driver drive.Driver, opts Options) (*VFS, error) {
 	if err != nil {
 		return nil, err
 	}
+	source, err := drive.NewReadSource(driver, opts.Read)
+	if err != nil {
+		_ = stores.Close()
+		return nil, err
+	}
 	now := util.Now()
 	overlay, deleteState := view.NewOverlayDelayedDeleteState()
 	vs := view.NewView(opts.RootID, now, overlay)
@@ -162,6 +172,7 @@ func New(driver drive.Driver, opts Options) (*VFS, error) {
 		rootID:        opts.RootID,
 		encrypted:     opts.Encrypted,
 		testEnabled:   opts.TestEnabled,
+		readSource:    source,
 		done:          done,
 		view:          vs,
 		read:          read.NewState(stores.readCacheStore),
@@ -169,6 +180,7 @@ func New(driver drive.Driver, opts Options) (*VFS, error) {
 		listing:       listing.NewState(),
 		activeDebug:   observe.NewActiveStore(opts.Name),
 		faults:        faultinject.NewRegistry(0),
+		readFaults:    faultinject.NewReadFaultRegistry(),
 		pathLocks:     pathlock.New(),
 		closeDone:     make(chan struct{}),
 	}
@@ -179,6 +191,9 @@ func New(driver drive.Driver, opts Options) (*VFS, error) {
 		Observer: newVFSReadObserver(v.read, v.activeDebug),
 		Health:   vfsReadHealth{tracker: v.healthTracker},
 		Counters: v.counters,
+
+		Source:     source,
+		ReadFaults: v.readFaults,
 	})
 	v.lister = listing.NewLister(listing.ListerDeps{
 		Remote: newVFSListingRemote(v),
@@ -187,6 +202,15 @@ func New(driver drive.Driver, opts Options) (*VFS, error) {
 		Health: vfsListingHealth{tracker: v.healthTracker},
 	})
 	return v, nil
+}
+
+// ReadSourceForPath exposes the mounted source, including its shared admission budget.
+func (v *VFS) ReadSourceForPath(string) *drive.ReadSource { return v.readSource }
+func (v *VFS) ReadSourceForMount(name string) *drive.ReadSource {
+	if name != "" && name != v.name {
+		return nil
+	}
+	return v.readSource
 }
 
 // Start launches the upload workers and resumes pending uploads.
@@ -292,6 +316,9 @@ func (v *VFS) teardown() {
 		// before Start (Flush defers scheduling), and tests use done to model
 		// shutdown directly. Closing it here would double-close that channel.
 		var errs []error
+		if v.readSource != nil {
+			errs = append(errs, v.readSource.Close())
+		}
 		if err := v.read.Close(); err != nil {
 			errs = append(errs, err)
 		}
@@ -318,6 +345,9 @@ func (v *VFS) teardown() {
 	v.workerWG.Wait()
 	v.uploads.Wait()
 	var errs []error
+	if v.readSource != nil {
+		errs = append(errs, v.readSource.Close())
+	}
 	if err := v.read.Close(); err != nil {
 		errs = append(errs, err)
 	}

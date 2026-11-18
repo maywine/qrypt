@@ -18,6 +18,7 @@ func (d *Driver) Capabilities() []drive.Capability {
 		drive.CapabilityServerSideCopy,
 		drive.CapabilitySpace,
 		drive.CapabilityPathResolver,
+		drive.CapabilityParallelRange,
 	}
 }
 
@@ -32,6 +33,15 @@ func (d *Driver) RemoteHash(_ context.Context, entry drive.Entry) (drive.HashAlg
 		return drive.HashMD5, strings.ToLower(meta.Etag), nil
 	}
 	return "", "", drive.ErrUnsupported
+}
+
+// RemoteHashInfo reports the provider-computed MD5 from the listing Etag.
+func (d *Driver) RemoteHashInfo(ctx context.Context, entry drive.Entry) (drive.RemoteHashInfo, error) {
+	algorithm, hash, err := d.RemoteHash(ctx, entry)
+	if err != nil {
+		return drive.RemoteHashInfo{}, err
+	}
+	return drive.RemoteHashInfo{Algorithm: algorithm, Hash: hash, Verified: true, Source: drive.RemoteHashSourceProvider}, nil
 }
 
 func (d *Driver) Metrics(ctx context.Context, since time.Time) ([]drive.MetricEvent, error) {

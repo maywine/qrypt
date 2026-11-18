@@ -1,6 +1,8 @@
 package config
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,7 +13,9 @@ import (
 	"github.com/yinzhenyu/qrypt/pkg/crypt"
 	_ "github.com/yinzhenyu/qrypt/pkg/drivers/localfs"
 	_ "github.com/yinzhenyu/qrypt/pkg/drivers/onedrive"
+	_ "github.com/yinzhenyu/qrypt/pkg/drivers/p115"
 	_ "github.com/yinzhenyu/qrypt/pkg/drivers/p189"
+	_ "github.com/yinzhenyu/qrypt/pkg/drivers/quark"
 	_ "github.com/yinzhenyu/qrypt/pkg/drivers/sftp"
 )
 
@@ -557,7 +561,7 @@ func TestMountOptionsDefaults(t *testing.T) {
 		t.Fatalf("unexpected default volume name: %q", cfg.EffectiveVolumeName())
 	}
 	options := cfg.EffectiveMountOptions()
-	if got := strings.Join(options["darwin"], ","); got != "defer_permissions,auto_xattr,iosize=4194304" {
+	if got := strings.Join(options["darwin"], ","); got != "defer_permissions,auto_xattr,iosize=4194304,daemon_timeout=0" {
 		t.Fatalf("unexpected default darwin mount options: %q", got)
 	}
 	if cfg.ReadOnly {
@@ -743,5 +747,47 @@ func TestValidateMountAlternativeRequirements(t *testing.T) {
 				t.Fatalf("ValidateMount() error = %v, want substring %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestSaveRejectsMissingInputs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "qrypt.toml")
+	if err := Save(path, nil); err == nil || !strings.Contains(err.Error(), "configuration is empty") {
+		t.Fatalf("Save(nil) error = %v, want an empty-configuration error", err)
+	}
+	var ctx context.Context
+	if err := SaveContext(ctx, path, &Config{}); err == nil || !strings.Contains(err.Error(), "context required") {
+		t.Fatalf("SaveContext(nil) error = %v, want a context error", err)
+	}
+}
+
+func TestSaveContextCancelledDoesNotWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "qrypt.toml")
+	cfg := &Config{
+		Version: "1",
+		Mounts: []MountConfig{{
+			Name:   "local",
+			Type:   "localfs",
+			Params: ParamMap{"root_path": t.TempDir()},
+		}},
+	}
+	if err := Save(path, cfg); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := SaveContext(ctx, path, cfg); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("config changed after a canceled save")
 	}
 }

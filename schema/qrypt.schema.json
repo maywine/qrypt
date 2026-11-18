@@ -108,6 +108,18 @@
     "bandwidth": {
       "$ref": "#/definitions/bandwidthConfig"
     },
+    "credentials": {
+      "description": "Named credentials shared by mounts of the same account.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/credentialConfig"
+      },
+      "x-i18n": {
+        "zh-CN": {
+          "description": "可在多个挂载间共享的命名凭据"
+        }
+      }
+    },
     "mounts": {
       "description": "List of cloud-drive mounts exposed under the mount point.",
       "type": "array",
@@ -668,7 +680,8 @@
               "darwin": [
                 "defer_permissions",
                 "auto_xattr",
-                "iosize=4194304"
+                "iosize=4194304",
+                "daemon_timeout=0"
               ],
               "windows": [
                 "FileInfoTimeout=1000"
@@ -811,11 +824,22 @@
             "webdav",
             "sftp",
             "s3",
-            "123"
+            "123",
+            "drime",
+            "koofr"
           ],
           "x-i18n": {
             "zh-CN": {
               "description": "驱动类型"
+            }
+          }
+        },
+        "credential": {
+          "description": "Name of a `[[credentials]]` entry this mount uses. Mutually exclusive with credential-scope params in `params`.",
+          "type": "string",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "引用的 `[[credentials]]` 名称；与 `params` 中的凭据级参数互斥"
             }
           }
         },
@@ -871,6 +895,15 @@
             }
           },
           "description": "Per-mount upload overrides."
+        },
+        "read": {
+          "$ref": "#/definitions/readConfig",
+          "description": "Optional per-mount read policy override.",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "该 mount 的读取策略覆盖（可选）"
+            }
+          }
         }
       },
       "required": [
@@ -1185,6 +1218,50 @@
               }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "drime"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/drimeParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "koofr"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/koofrParams"
+              }
+            }
+          }
         }
       ],
       "additionalProperties": false,
@@ -1211,7 +1288,8 @@
             "zh-CN": {
               "description": "本地文件系统根目录路径"
             }
-          }
+          },
+          "x-param-scope": "mount"
         }
       },
       "additionalProperties": false,
@@ -1243,7 +1321,8 @@
             "zh-CN": {
               "description": "网盘 refresh token，用于 OAuth 认证"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "drive_id": {
           "description": "Aliyun Drive drive ID.",
@@ -1254,7 +1333,8 @@
             "zh-CN": {
               "description": "阿里云盘 drive ID"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "root_path": {
           "description": "Virtual root path, resolved to the provider folder ID at startup.",
@@ -1265,7 +1345,8 @@
             "zh-CN": {
               "description": "虚拟根路径，启动时解析为网盘文件夹 ID"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "order_by": {
           "description": "File listing sort field.",
@@ -1281,7 +1362,8 @@
             "zh-CN": {
               "description": "列表排序字段"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "order_direction": {
           "description": "Sort direction (ASC or DESC).",
@@ -1295,7 +1377,8 @@
             "zh-CN": {
               "description": "排序方向（ASC 或 DESC）"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "api_base_url": {
           "description": "Custom API base URL.",
@@ -1305,7 +1388,8 @@
             "zh-CN": {
               "description": "自定义 API 基础 URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "auth_url": {
           "description": "Custom OAuth token URL.",
@@ -1315,7 +1399,8 @@
             "zh-CN": {
               "description": "自定义 OAuth token URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         }
       },
       "additionalProperties": false,
@@ -1346,7 +1431,8 @@
             "zh-CN": {
               "description": "网盘 refresh token，用于 OAuth 认证"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "access_token": {
           "description": "Optional initial Baidu Netdisk access token; refreshed automatically when needed.",
@@ -1356,7 +1442,8 @@
             "zh-CN": {
               "description": "可选的初始 access token；过期后自动刷新"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "root_path": {
           "description": "Baidu Netdisk path used as this mount root.",
@@ -1367,7 +1454,8 @@
             "zh-CN": {
               "description": "作为挂载根的百度网盘路径"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "order_by": {
           "description": "List ordering field: name, time, or size.",
@@ -1382,7 +1470,8 @@
             "zh-CN": {
               "description": "列表排序字段"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "order_direction": {
           "description": "List ordering direction: asc or desc.",
@@ -1396,7 +1485,8 @@
             "zh-CN": {
               "description": "排序方向（asc 或 desc）"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "use_online_api": {
           "description": "Use OpenList-compatible online token refresh API.",
@@ -1406,7 +1496,8 @@
             "zh-CN": {
               "description": "使用 OpenList 兼容的在线 token 刷新接口"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "online_api": {
           "description": "Online token refresh API URL.",
@@ -1416,7 +1507,8 @@
             "zh-CN": {
               "description": "在线 token 刷新接口 URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "upload_api": {
           "description": "Baidu PCS upload API base URL.",
@@ -1426,7 +1518,8 @@
             "zh-CN": {
               "description": "百度 PCS 上传接口基础 URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "client_id": {
           "description": "Baidu app API Key used as OAuth client_id when use_online_api=false.",
@@ -1436,7 +1529,8 @@
             "zh-CN": {
               "description": "OAuth 应用 client ID"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "client_secret": {
           "description": "Baidu app Secret Key used as OAuth client_secret when use_online_api=false.",
@@ -1446,7 +1540,8 @@
             "zh-CN": {
               "description": "OAuth 应用 client secret"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "api_base_url": {
           "description": "Custom Baidu REST API base URL.",
@@ -1456,7 +1551,8 @@
             "zh-CN": {
               "description": "自定义 API 基础 URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "oauth_url": {
           "description": "Custom Baidu OAuth token URL.",
@@ -1466,7 +1562,8 @@
             "zh-CN": {
               "description": "自定义 OAuth token URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "download_user_agent": {
           "description": "User-Agent used for Baidu download requests.",
@@ -1476,7 +1573,8 @@
             "zh-CN": {
               "description": "百度网盘下载请求使用的 User-Agent"
             }
-          }
+          },
+          "x-param-scope": "mount"
         }
       },
       "additionalProperties": false,
@@ -1507,7 +1605,8 @@
             "zh-CN": {
               "description": "网盘认证 cookie，从网页端登录后获取"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "root_path": {
           "description": "Virtual root path on the drive.",
@@ -1518,7 +1617,8 @@
             "zh-CN": {
               "description": "网盘上的虚拟根路径"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "base_url": {
           "description": "Custom API base URL.",
@@ -1528,7 +1628,8 @@
             "zh-CN": {
               "description": "自定义 API 基础 URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "v2_url": {
           "description": "Custom API v2 URL.",
@@ -1538,7 +1639,8 @@
             "zh-CN": {
               "description": "自定义 API v2 URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "wg_keys": {
           "description": "Override wg data keys for offline requests as secureNo:hexkey pairs separated by commas.",
@@ -1548,7 +1650,8 @@
             "zh-CN": {
               "description": "离线请求使用的 wg data keys，格式为 secureNo:hexkey，逗号分隔"
             }
-          }
+          },
+          "x-param-scope": "mount"
         }
       },
       "additionalProperties": false,
@@ -1579,7 +1682,8 @@
             "zh-CN": {
               "description": "移动云盘 authorization token，从网页端登录后获取"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "root_path": {
           "description": "Virtual root path, resolved to the provider folder ID at startup.",
@@ -1590,7 +1694,8 @@
             "zh-CN": {
               "description": "虚拟根路径，启动时解析为网盘文件夹 ID"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "root_id": {
           "description": "Pre-resolved folder ID (skips root_path resolution).",
@@ -1600,7 +1705,8 @@
             "zh-CN": {
               "description": "预解析的文件夹 ID；设置后忽略 root_path"
             }
-          }
+          },
+          "x-param-scope": "mount"
         }
       },
       "additionalProperties": false,
@@ -1631,7 +1737,8 @@
             "zh-CN": {
               "description": "网盘认证 cookie，从网页端登录后获取"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "root_path": {
           "description": "Virtual root path, resolved to the provider folder ID at startup.",
@@ -1642,7 +1749,8 @@
             "zh-CN": {
               "description": "虚拟根路径，启动时解析为网盘文件夹 ID"
             }
-          }
+          },
+          "x-param-scope": "mount"
         }
       },
       "additionalProperties": false,
@@ -1673,7 +1781,8 @@
             "zh-CN": {
               "description": "网盘 refresh token，用于 OAuth 认证"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "access_token": {
           "description": "115 open platform access token (optional; refreshed automatically when missing or expired).",
@@ -1684,7 +1793,8 @@
             "zh-CN": {
               "description": "可选的初始 access token；过期后自动刷新"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "root_path": {
           "description": "Virtual root path, resolved to the provider folder ID at startup.",
@@ -1695,7 +1805,8 @@
             "zh-CN": {
               "description": "虚拟根路径，启动时解析为网盘文件夹 ID"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "limit_rate": {
           "description": "Limit all API requests to N per second.",
@@ -1705,7 +1816,8 @@
             "zh-CN": {
               "description": "限制 API 请求速率（每秒 N 次）"
             }
-          }
+          },
+          "x-param-scope": "mount"
         }
       },
       "additionalProperties": false,
@@ -1734,7 +1846,8 @@
             "zh-CN": {
               "description": "网盘认证 cookie，从网页端登录后获取"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "username": {
           "description": "189 cloud drive account (phone number).",
@@ -1745,7 +1858,8 @@
             "zh-CN": {
               "description": "189 云盘账号（手机号）"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "password": {
           "description": "189 cloud drive password.",
@@ -1757,7 +1871,8 @@
             "zh-CN": {
               "description": "189 云盘密码"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "root_path": {
           "description": "Virtual root path on the drive.",
@@ -1768,7 +1883,8 @@
             "zh-CN": {
               "description": "网盘上的虚拟根路径（设置 root_id 时忽略）"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "root_id": {
           "description": "Pre-resolved folder ID (skips root_path resolution).",
@@ -1778,7 +1894,8 @@
             "zh-CN": {
               "description": "预解析的文件夹 ID；设置后忽略 root_path"
             }
-          }
+          },
+          "x-param-scope": "mount"
         }
       },
       "anyOf": [
@@ -1823,7 +1940,8 @@
             "zh-CN": {
               "description": "WebDAV 服务器基础 URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "username": {
           "description": "WebDAV authentication username.",
@@ -1834,7 +1952,8 @@
             "zh-CN": {
               "description": "WebDAV 用户名"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "password": {
           "description": "WebDAV authentication password or app token.",
@@ -1846,7 +1965,8 @@
             "zh-CN": {
               "description": "WebDAV 密码或应用 token"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "root_path": {
           "description": "Optional path under the WebDAV base URL used as this mount root.",
@@ -1857,7 +1977,8 @@
             "zh-CN": {
               "description": "WebDAV 基础 URL 下的可选子路径"
             }
-          }
+          },
+          "x-param-scope": "mount"
         }
       },
       "additionalProperties": false,
@@ -1888,7 +2009,8 @@
             "zh-CN": {
               "description": "SFTP 服务器地址，包含端口"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "username": {
           "description": "SFTP username.",
@@ -1899,7 +2021,8 @@
             "zh-CN": {
               "description": "SFTP 用户名"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "password": {
           "description": "SFTP password; use password or private_key.",
@@ -1910,7 +2033,8 @@
             "zh-CN": {
               "description": "SFTP 密码；与 private_key 二选一"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "private_key": {
           "description": "Path to or PEM-encoded SSH private key; use private_key or password.",
@@ -1921,7 +2045,8 @@
             "zh-CN": {
               "description": "SSH 私钥路径或 PEM 内容；与 password 二选一"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "passphrase": {
           "description": "SSH private key passphrase.",
@@ -1931,7 +2056,8 @@
             "zh-CN": {
               "description": "SSH 私钥口令"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "known_hosts": {
           "description": "OpenSSH known_hosts file used to verify the SFTP server; defaults to ~/.ssh/known_hosts and fails if missing or the server key is untrusted",
@@ -1941,7 +2067,8 @@
             "zh-CN": {
               "description": "校验 SFTP 服务器的 OpenSSH known_hosts 文件，默认 ~/.ssh/known_hosts；文件缺失或服务器密钥不可信时拒绝连接"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "root_path": {
           "description": "Remote directory used as this mount root.",
@@ -1952,7 +2079,8 @@
             "zh-CN": {
               "description": "作为挂载根的远程目录"
             }
-          }
+          },
+          "x-param-scope": "mount"
         }
       },
       "anyOf": [
@@ -1999,7 +2127,8 @@
             "zh-CN": {
               "description": "网盘 refresh token，用于 OAuth 认证"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "access_token": {
           "description": "Optional initial OneDrive access token; refreshed automatically when needed.",
@@ -2010,7 +2139,8 @@
             "zh-CN": {
               "description": "可选的初始 access token；过期后自动刷新"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "region": {
           "description": "Microsoft cloud region.",
@@ -2026,7 +2156,8 @@
             "zh-CN": {
               "description": "Microsoft 云区域（global、cn、us 或 de）"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "root_path": {
           "description": "OneDrive path used as this mount root.",
@@ -2037,7 +2168,8 @@
             "zh-CN": {
               "description": "作为挂载根的 OneDrive 路径"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "use_online_api": {
           "description": "Use OpenList-compatible online token refresh API.",
@@ -2047,7 +2179,8 @@
             "zh-CN": {
               "description": "使用 OpenList 兼容的在线 token 刷新接口"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "online_api": {
           "description": "Online token refresh API URL.",
@@ -2057,7 +2190,8 @@
             "zh-CN": {
               "description": "在线 token 刷新接口 URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "client_id": {
           "description": "OAuth client ID used when use_online_api=false; mutually exclusive with client_key.",
@@ -2068,7 +2202,8 @@
             "zh-CN": {
               "description": "OAuth 应用 client ID"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "client_key": {
           "description": "Alias for client_id.",
@@ -2079,7 +2214,8 @@
             "zh-CN": {
               "description": "client_id 的别名"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "client_secret": {
           "description": "OAuth client secret used when use_online_api=false.",
@@ -2090,7 +2226,8 @@
             "zh-CN": {
               "description": "OAuth 应用 client secret"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "redirect_uri": {
           "description": "OAuth redirect URI used when your Microsoft app requires it.",
@@ -2100,7 +2237,8 @@
             "zh-CN": {
               "description": "OAuth 回调地址"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "api_base_url": {
           "description": "Custom Microsoft Graph API base URL.",
@@ -2110,7 +2248,8 @@
             "zh-CN": {
               "description": "自定义 API 基础 URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "oauth_base_url": {
           "description": "Custom Microsoft OAuth base URL.",
@@ -2120,7 +2259,8 @@
             "zh-CN": {
               "description": "自定义 Microsoft OAuth 基础 URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "is_sharepoint": {
           "description": "Use SharePoint site drive instead of the current user's drive.",
@@ -2130,7 +2270,8 @@
             "zh-CN": {
               "description": "挂载 SharePoint 站点，而不是当前用户的 OneDrive"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "site_id": {
           "description": "SharePoint site ID when is_sharepoint=true.",
@@ -2140,7 +2281,8 @@
             "zh-CN": {
               "description": "SharePoint 站点 ID（is_sharepoint=true 时使用）"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "custom_host": {
           "description": "Custom host for download URLs.",
@@ -2150,7 +2292,8 @@
             "zh-CN": {
               "description": "下载链接使用的自定义域名（如 CDN）"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "chunk_size": {
           "description": "Large upload chunk size in MiB.",
@@ -2160,7 +2303,8 @@
             "zh-CN": {
               "description": "大文件上传分片大小（MiB）"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "disable_disk_usage": {
           "description": "Disable OneDrive quota query.",
@@ -2170,7 +2314,8 @@
             "zh-CN": {
               "description": "关闭网盘容量查询"
             }
-          }
+          },
+          "x-param-scope": "mount"
         }
       },
       "additionalProperties": false,
@@ -2215,7 +2360,8 @@
             "zh-CN": {
               "description": "OAuth 应用 client ID"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "client_key": {
           "description": "Alias for client_id.",
@@ -2226,7 +2372,8 @@
             "zh-CN": {
               "description": "client_id 的别名"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "client_secret": {
           "description": "Microsoft Entra application client secret.",
@@ -2238,7 +2385,8 @@
             "zh-CN": {
               "description": "OAuth 应用 client secret"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "tenant_id": {
           "description": "Microsoft Entra tenant ID.",
@@ -2249,7 +2397,8 @@
             "zh-CN": {
               "description": "Microsoft Entra 租户 ID"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "email": {
           "description": "User principal name or email whose drive should be mounted.",
@@ -2260,7 +2409,8 @@
             "zh-CN": {
               "description": "要挂载的账号邮箱"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "region": {
           "description": "Microsoft cloud region.",
@@ -2276,7 +2426,8 @@
             "zh-CN": {
               "description": "Microsoft 云区域（global、cn、us 或 de）"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "root_path": {
           "description": "OneDrive path used as this mount root.",
@@ -2287,7 +2438,8 @@
             "zh-CN": {
               "description": "作为挂载根的 OneDrive 路径"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "api_base_url": {
           "description": "Custom Microsoft Graph API base URL.",
@@ -2297,7 +2449,8 @@
             "zh-CN": {
               "description": "自定义 API 基础 URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "oauth_base_url": {
           "description": "Custom Microsoft OAuth base URL.",
@@ -2307,7 +2460,8 @@
             "zh-CN": {
               "description": "自定义 Microsoft OAuth 基础 URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "custom_host": {
           "description": "Custom host for download URLs.",
@@ -2317,7 +2471,8 @@
             "zh-CN": {
               "description": "下载链接使用的自定义域名（如 CDN）"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "chunk_size": {
           "description": "Large upload chunk size in MiB.",
@@ -2327,7 +2482,8 @@
             "zh-CN": {
               "description": "大文件上传分片大小（MiB）"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "disable_disk_usage": {
           "description": "Disable OneDrive quota query.",
@@ -2337,7 +2493,8 @@
             "zh-CN": {
               "description": "关闭网盘容量查询"
             }
-          }
+          },
+          "x-param-scope": "mount"
         }
       },
       "additionalProperties": false,
@@ -2370,7 +2527,8 @@
             "zh-CN": {
               "description": "S3 bucket 名称"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "endpoint": {
           "description": "S3 endpoint URL.",
@@ -2381,7 +2539,8 @@
             "zh-CN": {
               "description": "S3 服务端点 URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "region": {
           "description": "AWS region.",
@@ -2392,7 +2551,8 @@
             "zh-CN": {
               "description": "AWS 区域"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "access_key_id": {
           "description": "S3 access key ID.",
@@ -2404,7 +2564,8 @@
             "zh-CN": {
               "description": "S3 访问密钥 ID"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "secret_access_key": {
           "description": "S3 secret access key.",
@@ -2416,7 +2577,8 @@
             "zh-CN": {
               "description": "S3 访问密钥 Secret"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "session_token": {
           "description": "S3 session token (for temporary credentials).",
@@ -2426,7 +2588,8 @@
             "zh-CN": {
               "description": "S3 临时凭证的 session token"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "custom_host": {
           "description": "Custom host for download URLs (e.g. CDN domain).",
@@ -2436,7 +2599,8 @@
             "zh-CN": {
               "description": "下载链接使用的自定义域名（如 CDN）"
             }
-          }
+          },
+          "x-param-scope": "both"
         },
         "force_path_style": {
           "description": "Force path-style addressing (required for MinIO and most non-AWS S3).",
@@ -2447,7 +2611,8 @@
             "zh-CN": {
               "description": "强制使用 path-style 寻址（MinIO 和多数非 AWS S3 需要）"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "list_object_version": {
           "description": "S3 list API version: v1 or v2.",
@@ -2461,7 +2626,8 @@
             "zh-CN": {
               "description": "S3 列表 API 版本：v1 或 v2"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "placeholder": {
           "description": "Placeholder filename for empty directories.",
@@ -2472,7 +2638,8 @@
             "zh-CN": {
               "description": "空目录使用的占位文件名"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "root_path": {
           "description": "Root path prefix within the bucket.",
@@ -2483,7 +2650,8 @@
             "zh-CN": {
               "description": "Bucket 内的根路径前缀"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "sign_url_expire": {
           "description": "Presigned URL expiration duration.",
@@ -2495,7 +2663,8 @@
               "description": "预签名下载链接有效期"
             }
           },
-          "x-param-type": "duration"
+          "x-param-type": "duration",
+          "x-param-scope": "mount"
         }
       },
       "additionalProperties": false,
@@ -2526,7 +2695,8 @@
             "zh-CN": {
               "description": "123 云盘账号（手机号或邮箱）"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "password": {
           "description": "123pan account password.",
@@ -2538,7 +2708,8 @@
             "zh-CN": {
               "description": "123 云盘密码"
             }
-          }
+          },
+          "x-param-scope": "credential"
         },
         "root_path": {
           "description": "Virtual root path on the drive (ignored when root_id is set).",
@@ -2549,7 +2720,8 @@
             "zh-CN": {
               "description": "网盘上的虚拟根路径（设置 root_id 时忽略）"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "root_id": {
           "description": "Pre-resolved folder ID; when set, root_path is ignored.",
@@ -2559,7 +2731,8 @@
             "zh-CN": {
               "description": "预解析的文件夹 ID；设置后忽略 root_path"
             }
-          }
+          },
+          "x-param-scope": "mount"
         },
         "base_url": {
           "description": "Custom API base URL.",
@@ -2569,7 +2742,8 @@
             "zh-CN": {
               "description": "自定义 API 基础 URL"
             }
-          }
+          },
+          "x-param-scope": "both"
         }
       },
       "additionalProperties": false,
@@ -2583,6 +2757,753 @@
           "title": "123 云盘"
         }
       }
+    },
+    "credentialConfig": {
+      "type": "object",
+      "description": "A named credential shared by any number of mounts of the same account.",
+      "required": [
+        "name",
+        "type"
+      ],
+      "properties": {
+        "name": {
+          "description": "Credential name, referenced by mounts through their `credential` field.",
+          "type": "string",
+          "minLength": 1,
+          "x-i18n": {
+            "zh-CN": {
+              "description": "凭据名称，mount 通过 `credential` 字段引用"
+            }
+          }
+        },
+        "type": {
+          "description": "Driver type this credential authenticates.",
+          "type": "string",
+          "enum": [
+            "localfs",
+            "aliyundrive",
+            "baidu_netdisk",
+            "quark",
+            "yun139",
+            "115",
+            "115_open",
+            "189",
+            "webdav",
+            "sftp",
+            "onedrive",
+            "onedrive_app",
+            "s3",
+            "123",
+            "drime",
+            "koofr"
+          ],
+          "x-i18n": {
+            "zh-CN": {
+              "description": "凭据对应的驱动类型"
+            }
+          }
+        },
+        "params": {
+          "description": "Credential-scope driver parameters (for example `cookie` or `refresh_token`).",
+          "type": "object",
+          "patternProperties": {
+            "^.*$": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "x-i18n": {
+            "zh-CN": {
+              "description": "凭据级驱动参数（如 cookie、refresh_token）"
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "localfs"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/localfsParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "aliyundrive"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/aliyundriveParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "baidu_netdisk"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/baiduNetdiskParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "quark"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/quarkParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "yun139"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/yun139Params"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "115"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/p115Params"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "115_open"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/p115openParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "189"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/p189Params"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "webdav"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/webdavParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "sftp"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/sftpParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "onedrive"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/onedriveParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "onedrive_app"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/onedriveAppParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "s3"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/s3Params"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "123"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/p123Params"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "drime"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/drimeParams"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "koofr"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "required": [
+              "params"
+            ],
+            "properties": {
+              "params": {
+                "$ref": "#/definitions/koofrParams"
+              }
+            }
+          }
+        }
+      ],
+      "title": "Credential",
+      "x-i18n": {
+        "zh-CN": {
+          "title": "共享凭据",
+          "description": "可在多个挂载之间共享的一份账号凭据"
+        }
+      }
+    },
+    "drimeParams": {
+      "type": "object",
+      "required": [
+        "access_token"
+      ],
+      "properties": {
+        "access_token": {
+          "description": "Drime personal access token.",
+          "type": "string",
+          "minLength": 1,
+          "x-secret": true,
+          "x-example": "your-access-token",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "Drime 个人访问令牌"
+            }
+          },
+          "x-param-scope": "credential"
+        },
+        "workspace_id": {
+          "description": "Workspace ID; 0 is the personal space.",
+          "type": "integer",
+          "default": 0,
+          "x-example": 1234,
+          "x-i18n": {
+            "zh-CN": {
+              "description": "工作空间 ID；0 表示个人空间"
+            }
+          },
+          "x-param-scope": "mount"
+        },
+        "root_path": {
+          "description": "Directory path used as this mount root.",
+          "type": "string",
+          "default": "/",
+          "x-example": "/qrypt",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "作为挂载根的目录路径"
+            }
+          },
+          "x-param-scope": "mount"
+        },
+        "root_id": {
+          "description": "Pre-resolved folder ID; skips root_path resolution.",
+          "type": "string",
+          "x-example": "1032808373",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "预解析的文件夹 ID；设置后跳过 root_path"
+            }
+          },
+          "x-param-scope": "mount"
+        },
+        "api_base_url": {
+          "description": "Custom Drime API base URL.",
+          "type": "string",
+          "default": "https://app.drime.cloud/api/v1",
+          "x-example": "https://app.drime.cloud/api/v1",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "自定义 Drime API 基础 URL"
+            }
+          },
+          "x-param-scope": "both"
+        },
+        "chunk_size": {
+          "description": "Multipart upload chunk size in MiB (minimum 5).",
+          "type": "integer",
+          "default": 64,
+          "minimum": 5,
+          "x-example": 64,
+          "x-i18n": {
+            "zh-CN": {
+              "description": "分片上传的块大小（MiB，最小 5）"
+            }
+          },
+          "x-param-scope": "mount"
+        },
+        "upload_concurrency": {
+          "description": "Concurrent multipart part uploads.",
+          "type": "integer",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 32,
+          "x-example": 4,
+          "x-i18n": {
+            "zh-CN": {
+              "description": "分片上传并发数"
+            }
+          },
+          "x-param-scope": "mount"
+        },
+        "instant_upload": {
+          "description": "Verify the provider's stored content and reuse it instead of re-uploading.",
+          "type": "boolean",
+          "default": true,
+          "x-i18n": {
+            "zh-CN": {
+              "description": "校验通过后复用网盘已有内容，避免重复上传"
+            }
+          },
+          "x-param-scope": "mount"
+        },
+        "presign_small": {
+          "description": "Use presigned single-part uploads below 5 MiB.",
+          "type": "boolean",
+          "default": false,
+          "x-i18n": {
+            "zh-CN": {
+              "description": "小于 5 MiB 的文件使用预签名直传"
+            }
+          },
+          "x-param-scope": "mount"
+        },
+        "limit_rate": {
+          "description": "Limit API requests per second (0 = unlimited).",
+          "type": "integer",
+          "default": 0,
+          "minimum": 0,
+          "x-example": 10,
+          "x-i18n": {
+            "zh-CN": {
+              "description": "限制 API 请求速率（每秒 N 次，0 表示不限制）"
+            }
+          },
+          "x-param-scope": "mount"
+        },
+        "hard_delete": {
+          "description": "Delete permanently instead of moving to trash.",
+          "type": "boolean",
+          "default": false,
+          "x-i18n": {
+            "zh-CN": {
+              "description": "永久删除而不是移到回收站"
+            }
+          },
+          "x-param-scope": "mount"
+        }
+      },
+      "additionalProperties": false,
+      "title": "Drime Cloud",
+      "x-driver": {
+        "type": "drime",
+        "order": 15
+      },
+      "x-i18n": {
+        "zh-CN": {
+          "title": "Drime 云盘"
+        }
+      }
+    },
+    "koofrParams": {
+      "type": "object",
+      "required": [
+        "email",
+        "app_password"
+      ],
+      "properties": {
+        "email": {
+          "description": "Koofr account email",
+          "type": "string",
+          "minLength": 1,
+          "x-example": "user@example.com",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "Koofr 账号邮箱"
+            }
+          },
+          "x-param-scope": "credential"
+        },
+        "app_password": {
+          "description": "Koofr app password (Settings -> App passwords)",
+          "type": "string",
+          "minLength": 1,
+          "x-secret": true,
+          "x-example": "your-app-password",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "Koofr 应用密码（设置 -> 应用密码）"
+            }
+          },
+          "x-param-scope": "credential"
+        },
+        "mount_id": {
+          "description": "Lock the mount to one provider mount id; by default the root aggregates the primary storage and online external mounts",
+          "type": "string",
+          "x-example": "749b91a4-c96b-4cfb-a457-526827ad9622",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "锁定单一网盘挂载 ID；默认挂载根聚合主存储与在线外部挂载"
+            }
+          },
+          "x-param-scope": "mount"
+        },
+        "root_path": {
+          "description": "Directory path used as this mount root; requires mount_id (the default virtual root only serves /)",
+          "type": "string",
+          "default": "/",
+          "x-example": "/qrypt",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "作为挂载根的目录路径；需配合 mount_id 使用（默认虚拟根仅支持 /）"
+            }
+          },
+          "x-param-scope": "mount"
+        },
+        "api_base_url": {
+          "description": "Custom Koofr API base URL",
+          "type": "string",
+          "default": "https://app.koofr.net",
+          "x-example": "https://app.koofr.net",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "自定义 Koofr API 基础 URL"
+            }
+          },
+          "x-param-scope": "both"
+        }
+      },
+      "additionalProperties": false,
+      "title": "Koofr",
+      "x-driver": {
+        "type": "koofr",
+        "order": 16
+      },
+      "x-i18n": {
+        "zh-CN": {
+          "title": "Koofr 云盘"
+        }
+      }
+    },
+    "readConfig": {
+      "type": "object",
+      "title": "Read policy",
+      "description": "Mount read overrides. Omitted fields inherit driver recommendations; explicit zero request counts are invalid.",
+      "x-i18n": {
+        "zh-CN": {
+          "title": "读取策略",
+          "description": "按挂载覆盖读取策略；省略字段继承驱动建议，在途预算同时约束前台、预取、复制和分享下载。请求数显式填 0 无效。"
+        }
+      },
+      "properties": {
+        "max_in_flight": {
+          "type": "integer",
+          "description": "Maximum in-flight ranges for one object.",
+          "x-doc-default": "继承驱动",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "同一文件的最大在途 Range 数（1–32），受驱动硬限制约束。"
+            }
+          },
+          "minimum": 1,
+          "maximum": 32
+        },
+        "bulk": {
+          "$ref": "#/definitions/bulkReadConfig",
+          "type": "object",
+          "description": "Bulk window and splitting overrides.",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "批量读取窗口与分片设置（见下表）"
+            }
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "bulkReadConfig": {
+      "type": "object",
+      "title": "Bulk read policy",
+      "description": "Bulk reads use bounded windows and a worker limit.",
+      "x-i18n": {
+        "zh-CN": {
+          "title": "批量读取策略",
+          "description": "配置批量下载和复制的窗口与并发。尺寸使用字节或 KiB/MiB，最大 32 MiB。交互读取和探测保持单流。"
+        }
+      },
+      "properties": {
+        "streams": {
+          "type": "integer",
+          "description": "Concurrent workers, independent of task count.",
+          "x-doc-default": "继承驱动",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "批量读取的并发 worker 数（1–32），受文件在途预算约束。"
+            }
+          },
+          "minimum": 1,
+          "maximum": 32
+        },
+        "window": {
+          "type": "string",
+          "description": "Bounded logical window size, up to 32 MiB.",
+          "x-doc-default": "继承驱动",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "每次取数的窗口大小，例如 8MiB；必须大于 0，最大 32 MiB。"
+            }
+          }
+        },
+        "part_size": {
+          "type": "string",
+          "description": "Strict part ceiling or auto for even division within a window.",
+          "x-doc-default": "继承驱动",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "每个分片的大小上限，例如 4MiB；auto 表示按流数均分窗口。分片数可大于并发数，0 无效。"
+            }
+          }
+        },
+        "min_parallel_size": {
+          "type": "string",
+          "description": "Smallest bounded window eligible for parallel splitting.",
+          "x-doc-default": "继承驱动",
+          "x-i18n": {
+            "zh-CN": {
+              "description": "允许并行拆分的最小窗口；0 表示不设门槛。按本次窗口判断，与文件总大小无关。"
+            }
+          }
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

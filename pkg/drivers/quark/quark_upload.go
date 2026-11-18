@@ -329,8 +329,11 @@ func quarkSourceHashes(source drive.ReadOnlyFileSource) (map[string]any, bool, e
 		return nil, false, drive.NonRetryable(fmt.Errorf("quark: source SHA-1 metadata has %d bytes, want %d", len(sha1Sum), sha1.Size))
 	}
 	return map[string]any{
-		"md5":  fmt.Sprintf("%X", md5Sum),
-		"sha1": fmt.Sprintf("%X", sha1Sum),
+		// Quark stores hashes in lowercase. An uppercase SHA-1 is rejected
+		// with "sha1 非法" when the provider already knows the content, which
+		// breaks deduplicated uploads.
+		"md5":  fmt.Sprintf("%x", md5Sum),
+		"sha1": fmt.Sprintf("%x", sha1Sum),
 	}, true, nil
 }
 
@@ -350,8 +353,8 @@ func quarkComputeSourceHashes(ctx context.Context, source drive.ReadOnlyFileSour
 		return nil, fmt.Errorf("quark: upload hash size mismatch: hashed %d, expected %d", n, size)
 	}
 	return map[string]any{
-		"md5":  fmt.Sprintf("%X", md5Hash.Sum(nil)),
-		"sha1": fmt.Sprintf("%X", sha1Hash.Sum(nil)),
+		"md5":  fmt.Sprintf("%x", md5Hash.Sum(nil)),
+		"sha1": fmt.Sprintf("%x", sha1Hash.Sum(nil)),
 	}, nil
 }
 
@@ -713,24 +716,46 @@ func apiError(resp respEnvelope) error {
 	return &APIError{Status: resp.Status, Code: resp.Code, Message: resp.Message}
 }
 
+// traceReadCloser reports a body read failure and the body's delivery time.
+// It deliberately makes no throughput judgement: "slow" is not a connection
+// failure, and the read layer's own idle and total bounds already stop a
+// stalled fetch.
 type traceReadCloser struct {
 	io.ReadCloser
-	fid    string
-	offset int64
-	size   int64
-	start  time.Time
-	read   int64
+	fid     string
+	offset  int64
+	size    int64
+	start   time.Time
+	read    int64
+	busy    time.Duration
+	onError func(error, int64, time.Duration)
 }
 
+// errDownloadShortBody marks a body that ended before the requested range was
+// complete. The provider closed the connection early, which is a transfer
+// failure even though the body reported a clean EOF.
+var errDownloadShortBody = errors.New("quark: download body ended early")
+
 func (r *traceReadCloser) Read(p []byte) (int, error) {
+	readStart := time.Now()
 	n, err := r.ReadCloser.Read(p)
+	r.busy += time.Since(readStart)
 	r.read += int64(n)
+	if err == io.EOF && r.size > 0 && r.read < r.size && r.onError != nil {
+		// A short body only becomes visible to the read layer after the whole
+		// range is assembled; reporting it here lets the driver rotate away
+		// from the connection that truncated before the retry.
+		r.onError(errDownloadShortBody, r.read, r.busy)
+	}
+	if err != nil && err != io.EOF && r.onError != nil {
+		r.onError(err, r.read, r.busy)
+	}
 	return n, err
 }
 
 func (r *traceReadCloser) Close() error {
 	err := r.ReadCloser.Close()
-	logging.L.DebugfEvery("quark.read_body", time.Second, "[QUARK] ReadBody fid=%q offset=%d size=%d read=%d err=%v dur=%s", r.fid, r.offset, r.size, r.read, err, time.Since(r.start))
+	logging.L.DebugfEvery("quark.read_body", time.Second, "[QUARK] ReadBody fid=%q offset=%d size=%d read=%d err=%v dur=%s provider=%s", r.fid, r.offset, r.size, r.read, err, time.Since(r.start), r.busy)
 	return err
 }
 

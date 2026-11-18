@@ -92,13 +92,20 @@ func calSign(bodyJSON, ts, randStr string) string {
 }
 
 type client struct {
-	httpClient            *http.Client
+	httpClient *http.Client
+	// uploadClient has no total timeout: upload parts are 100 MiB (512 MiB for
+	// very large files) and cannot finish within the 60-second API timeout on
+	// a slow uplink. Each part gets a size-derived budget and an idle watchdog
+	// instead.
+	uploadClient          *http.Client
 	authorization         string
 	account               string
 	userDomainID          string
 	personalCloudHost     string
 	authRefreshURL        string
 	onAuthorizationUpdate func(authorization string)
+	onAuthRecovery        func() bool
+	onAuthFallback        func() bool
 	mu                    sync.RWMutex
 	tokenExpiry           time.Time
 	metrics               *driverutil.Buffer
@@ -107,6 +114,7 @@ type client struct {
 func newClient(authorization string) *client {
 	return &client{
 		httpClient:     httputil.NewClient(60*time.Second, 30*time.Second),
+		uploadClient:   httputil.NewClient(0, 60*time.Second),
 		authorization:  authorization,
 		authRefreshURL: "https://aas.caiyun.feixin.10086.cn:443/tellin/authTokenRefresh.do",
 		metrics:        driverutil.NewBuffer(500),
@@ -337,8 +345,26 @@ func (c *client) personalPost(ctx context.Context, path string, bodyData interfa
 		}
 		if err := c.personalPostOnce(ctx, path, bodyData, result); err != nil {
 			if isAuthExpiredError(err) {
+				if c.onAuthRecovery != nil && c.onAuthRecovery() {
+					retryErr := c.personalPostOnce(ctx, path, bodyData, result)
+					if retryErr == nil {
+						return nil
+					}
+					err = retryErr
+					if !isAuthExpiredError(err) {
+						lastErr = err
+						continue
+					}
+				}
 				if refreshErr := c.refreshToken(ctx); refreshErr != nil {
 					lastErr = fmt.Errorf("%w; refresh failed: %v", err, refreshErr)
+					if c.onAuthFallback != nil && c.onAuthFallback() {
+						if retryErr := c.personalPostOnce(ctx, path, bodyData, result); retryErr == nil {
+							return nil
+						} else {
+							lastErr = retryErr
+						}
+					}
 					continue
 				}
 				if retryErr := c.personalPostOnce(ctx, path, bodyData, result); retryErr == nil {
@@ -367,8 +393,26 @@ func (c *client) userPost(ctx context.Context, path string, bodyData interface{}
 		}
 		if err := c.userPostOnce(ctx, path, bodyData, result); err != nil {
 			if isAuthExpiredError(err) {
+				if c.onAuthRecovery != nil && c.onAuthRecovery() {
+					retryErr := c.userPostOnce(ctx, path, bodyData, result)
+					if retryErr == nil {
+						return nil
+					}
+					err = retryErr
+					if !isAuthExpiredError(err) {
+						lastErr = err
+						continue
+					}
+				}
 				if refreshErr := c.refreshToken(ctx); refreshErr != nil {
 					lastErr = fmt.Errorf("%w; refresh failed: %v", err, refreshErr)
+					if c.onAuthFallback != nil && c.onAuthFallback() {
+						if retryErr := c.userPostOnce(ctx, path, bodyData, result); retryErr == nil {
+							return nil
+						} else {
+							lastErr = retryErr
+						}
+					}
 					continue
 				}
 				if retryErr := c.userPostOnce(ctx, path, bodyData, result); retryErr == nil {

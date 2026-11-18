@@ -16,8 +16,10 @@ OUTPUT_PATH = os.path.join(ROOT, "docs", "for-user", "support-drivers.md")
 CAPABILITIES_CMD = ["go", "run", "./scripts/schema/gen-driver-capabilities"]
 
 # User-facing capability matrix. Keys are drive.Capability values, except
-# "remote_hash", which comes from the drive.RemoteHasher interface.
+# "remote_hash" (drive.RemoteHasher) and "read_parallel" (derived from
+# parallel_range / internal_parallel_read).
 CAPABILITY_COLUMNS = [
+    ("read_parallel", "并行读"),
     ("writer", "写入"),
     ("resumable_uploader", "断点续传"),
     ("server_side_copy", "服务端复制"),
@@ -25,7 +27,16 @@ CAPABILITY_COLUMNS = [
     ("mtime", "保留修改时间"),
     ("space", "空间查询"),
     ("offline_download", "离线下载"),
+    ("login", "扫码登录"),
 ]
+
+# Where a parameter may be configured: a shared credential, a mount, or both
+# (mount value wins).
+SCOPE_LABELS = {
+    "credential": "凭据",
+    "mount": "挂载",
+    "both": "两者",
+}
 
 
 def load_schema():
@@ -77,9 +88,22 @@ def prop_description(prop):
     )
 
 
+def capability_cell(info, key):
+    if key == "read_parallel":
+        capabilities = set(info["capabilities"])
+        if "internal_parallel_read" in capabilities:
+            return "内部"
+        if "parallel_range" in capabilities:
+            return "并行"
+        return "—"
+    return "✅" if has_capability(info, key) else "—"
+
+
 def has_capability(info, key):
     if key == "remote_hash":
         return info["remote_hash"]
+    if key == "login":
+        return info["login"]
     return key in info["capabilities"]
 
 
@@ -92,10 +116,7 @@ def build_capability_table(capabilities, drivers):
         info = capabilities.get(driver)
         if info is None:
             continue
-        cells = [
-            "✅" if has_capability(info, capability) else "—"
-            for capability, _ in CAPABILITY_COLUMNS
-        ]
+        cells = [capability_cell(info, capability) for capability, _ in CAPABILITY_COLUMNS]
         rows.append(f"| `{driver}` | " + " | ".join(cells) + " |")
     return "\n".join(rows)
 
@@ -210,8 +231,8 @@ def build_driver_section(definition):
     example_toml = "\n".join(example_lines)
 
     table_rows = []
-    table_rows.append("| 参数 | 类型 | 必填 | 说明 |")
-    table_rows.append("|---|---|---|---|")
+    table_rows.append("| 参数 | 类型 | 作用域 | 必填 | 说明 |")
+    table_rows.append("|---|---|---|---|---|")
     for pname, prop in props.items():
         if pname in always_required:
             is_required = "是"
@@ -226,7 +247,8 @@ def build_driver_section(definition):
         default_val = fmt_default(prop.get("default"))
         if default_val:
             desc += f"，默认 `{default_val}`"
-        table_rows.append(f"| `{pname}` | {type_str} | {is_required} | {desc} |")
+        scope = SCOPE_LABELS.get(prop.get("x-param-scope"), "两者")
+        table_rows.append(f"| `{pname}` | {type_str} | {scope} | {is_required} | {desc} |")
     param_table = "\n".join(table_rows)
     if len(alternatives) > 1:
         param_table = f"必填条件：{format_required_condition(definition)}。\n\n{param_table}"
@@ -265,6 +287,25 @@ def generate():
     lines.append("")
     lines.append("网盘凭证通常有时效，过期后需要重新获取。请将凭证保存在本机配置文件中，不要提交到版本库。")
     lines.append("")
+    lines.append("## 共享凭据")
+    lines.append("")
+    lines.append("同一账号挂载多个目录时，把账号级参数写进 `[[credentials]]` 一次，再让多个 `[[mounts]]` 通过 `credential` 引用它；路径级参数（如 `root_path`）仍写在各自的 `[mounts.params]` 中。凭据的轮换与刷新由 qrypt 统一维护，不会因为多挂载而各走各的。参数表中的“作用域”列说明每个参数应放在哪一侧：**凭据**、**挂载**或**两者**（两者时挂载值优先）。")
+    lines.append("")
+    lines.append("```toml")
+    lines.append('[[credentials]]')
+    lines.append('name = "main"')
+    lines.append('type = "quark"')
+    lines.append('[credentials.params]')
+    lines.append('cookie = "..."')
+    lines.append('')
+    lines.append('[[mounts]]')
+    lines.append('name = "docs"')
+    lines.append('type = "quark"')
+    lines.append('credential = "main"')
+    lines.append('[mounts.params]')
+    lines.append('root_path = "/Docs"')
+    lines.append("```")
+    lines.append("")
     lines.append("## 驱动列表")
     lines.append("")
     lines.append(build_driver_list_table(drivers))
@@ -276,11 +317,11 @@ def generate():
     lines.append("")
     lines.append(build_capability_table(capabilities, drivers))
     lines.append("")
-    lines.append("✅ 支持，— 不支持；不支持的能力会由上层降级或返回 unsupported。")
+    lines.append("✅ 支持，— 不支持；**并行读**：`并行` 表示支持 `[mounts.read.bulk]` 的 `streams > 1`，`内部` 表示驱动已内部并行、VFS 保持单流，`—` 表示只能单流。不支持的能力会由上层降级或返回 unsupported。")
     lines.append("")
-    lines.append("**写入**：创建、删除、移动、重命名；**服务端复制**：由存储端直接复制，不经过本地下载再上传；**服务端哈希**：可直接读取存储端内容哈希用于校验；**保留修改时间**：上传或复制后保留源文件 mtime。")
+    lines.append("**写入**：创建、删除、移动、重命名；**服务端复制**：由存储端直接复制，不经过本地下载再上传；**服务端哈希**：可直接读取存储端内容哈希用于校验；**保留修改时间**：上传或复制后保留源文件 mtime；**扫码登录**：可用 `qrypt credential login --type <驱动>` 扫码获取凭据，不支持时需手动填写 cookie 或 token。")
     lines.append("")
-    lines.append("`quark` 的离线下载同时支持解析、选择性转存和加速取回。")
+    lines.append("`quark` 的离线下载同时支持解析、选择性转存和加速取回；`115` / `115_open` 支持提交、观察和取回，但不支持解析预览、文件选择和加速。")
     lines.append("")
 
     for _, definition in drivers:

@@ -20,6 +20,15 @@ const (
 	// time. Sync uses it to decide whether mtime differences require an
 	// update; backends without it fall back to size/hash comparison only.
 	CapabilityMtime Capability = "mtime"
+	// CapabilityParallelRange means the driver accepts arbitrary offset/size
+	// reads and honors them as range requests (206), so the read domain may
+	// split one window into concurrent sub-ranges. A driver that cannot
+	// guarantee that must not declare it.
+	CapabilityParallelRange Capability = "parallel_range"
+	// CapabilityInternalParallelRead means the driver already parallelizes a
+	// single Read internally. The VFS keeps such a read single-stream so the
+	// two layers do not multiply each other's concurrency.
+	CapabilityInternalParallelRead Capability = "internal_parallel_read"
 	// CapabilityServerSideCopy means the driver can duplicate a stored
 	// object provider-side (ServerSideCopier) without downloading and
 	// re-uploading it. When declared together with CapabilityMtime, Copy
@@ -39,6 +48,21 @@ const (
 	// download session for a staged source, letting the caller stream it before
 	// the cloud-side import finishes.
 	CapabilityAcceleratedFetch Capability = "accelerated_fetch"
+	// CapabilityShare means the driver implements ShareManager: create, show,
+	// update, and remove links it owns. Account-wide listing additionally
+	// requires ShareLister; asynchronous saves additionally require
+	// ShareSavePoller.
+	CapabilityShare Capability = "share"
+	// CapabilityShareReceive means the driver implements ShareReceiver: open a
+	// link and browse its entries.
+	CapabilityShareReceive Capability = "share_receive"
+	// CapabilityShareSave means the driver implements ShareSaver: copy share
+	// content into the acting account's drive without moving bytes through
+	// qrypt.
+	CapabilityShareSave Capability = "share_save"
+	// CapabilityShareFetch means the driver implements ShareFetcher: hand out
+	// download targets for share content without saving it first.
+	CapabilityShareFetch Capability = "share_fetch"
 )
 
 // Capabilities returns the driver-declared optional behavior in a stable order.

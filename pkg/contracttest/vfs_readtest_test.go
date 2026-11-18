@@ -19,6 +19,16 @@ import (
 	"github.com/yinzhenyu/qrypt/pkg/vfs/vfstypes"
 )
 
+// shortenVFSIdleInterval lowers waitVFSSmokeIdle's sampling period for tests
+// whose assertions do not depend on how long an idle wait samples for. This
+// package does not run tests in parallel, so a package-level override is safe.
+func shortenVFSIdleInterval(t *testing.T) {
+	t.Helper()
+	restore := vfsSmokeIdleInterval
+	vfsSmokeIdleInterval = 10 * time.Millisecond
+	t.Cleanup(func() { vfsSmokeIdleInterval = restore })
+}
+
 type mountedReadCleanupFS struct {
 	*xferFakeFS
 	removeErrs     []error
@@ -66,6 +76,7 @@ func (f *mountedReadCleanupFS) ClearReadCacheForMount(string) error {
 }
 
 func TestRunVFSMountedReadTestRejectsBackendDirectoryAsMountPoint(t *testing.T) {
+	shortenVFSIdleInterval(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	remote := t.TempDir()
@@ -152,6 +163,34 @@ func TestMountedTestPathRequiresDirectory(t *testing.T) {
 	}
 }
 
+func TestMeasureMountedFileReadsSubRange(t *testing.T) {
+	data := make([]byte, 64<<10)
+	fillMountedReadPattern(data, 0)
+	file := t.TempDir() + "/data.bin"
+	if err := os.WriteFile(file, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const offset = int64(8 << 10)
+	const length = int64(16 << 10)
+	wantHash := sha256.Sum256(data[offset : offset+length])
+
+	measurement, _, err := measureMountedFile(
+		context.Background(), newXferFakeFS(), "local", file, fmt.Sprintf("%x", wantHash), 4<<10, offset, length, "cold", 1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if measurement.Bytes != length {
+		t.Fatalf("bytes = %d, want %d", measurement.Bytes, length)
+	}
+	if measurement.StartOffset != offset {
+		t.Fatalf("start offset = %d, want %d", measurement.StartOffset, offset)
+	}
+	if measurement.ContentHash != fmt.Sprintf("%x", wantHash) {
+		t.Fatalf("content hash = %s, want %x", measurement.ContentHash, wantHash)
+	}
+}
+
 func TestMeasureMountedFileIncludesFinalPartialPeakWindow(t *testing.T) {
 	data := make([]byte, 64<<10)
 	fillMountedReadPattern(data, 0)
@@ -162,7 +201,7 @@ func TestMeasureMountedFileIncludesFinalPartialPeakWindow(t *testing.T) {
 	wantHash := sha256.Sum256(data)
 
 	measurement, _, err := measureMountedFile(
-		context.Background(), newXferFakeFS(), "local", file, fmt.Sprintf("%x", wantHash), 4<<10, "cold", 1,
+		context.Background(), newXferFakeFS(), "local", file, fmt.Sprintf("%x", wantHash), 4<<10, 0, int64(len(data)), "cold", 1,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -304,7 +343,7 @@ func TestMeasureMountedSeekScenariosRecordOverlap(t *testing.T) {
 				context.Background(), fs, "local", file, virtualPath,
 				// This verifies overlap, not timeout behavior. Allow the normal
 				// shutdown budget for race-instrumented readers on busy runners.
-				16<<20, 1<<20, 0, scenario, 2, DefaultMountedSeekOverlapTimeout, "cold", 1, 1,
+				16<<20, 1<<20, 0, scenario, 2, DefaultMountedSeekOverlapTimeout, true, "cold", 1, 1,
 			)
 			if err != nil {
 				t.Fatal(err)
@@ -384,6 +423,7 @@ func TestSummarizeMountedSeeks(t *testing.T) {
 }
 
 func TestCleanupMountedReadFixtureRecoversFromTransientErrors(t *testing.T) {
+	shortenVFSIdleInterval(t)
 	fs := newMountedReadCleanupFS()
 	fs.removeErrs = []error{errors.New("temporary remove failure"), nil}
 	fs.removeDirErrs = []error{errors.New("directory is not empty"), nil}
@@ -397,6 +437,7 @@ func TestCleanupMountedReadFixtureRecoversFromTransientErrors(t *testing.T) {
 }
 
 func TestCleanupMountedReadFixtureReportsFinalDirectoryFailure(t *testing.T) {
+	shortenVFSIdleInterval(t)
 	fs := newMountedReadCleanupFS()
 	fs.removeDirErrs = []error{
 		errors.New("directory is not empty"),
@@ -414,6 +455,7 @@ func TestCleanupMountedReadFixtureReportsFinalDirectoryFailure(t *testing.T) {
 }
 
 func TestRunVFSMountedReadTestRecordsDeferredCleanupFailure(t *testing.T) {
+	shortenVFSIdleInterval(t)
 	fs := newMountedReadCleanupFS()
 	fs.clearErr = errors.New("clear cache failed")
 	fs.removeErrs = []error{
@@ -467,5 +509,25 @@ func TestMountedReadTestRunDoesNotDuplicateStepsOrMetrics(t *testing.T) {
 	}
 	if _, ok := read["seek_measurements"]; !ok {
 		t.Fatalf("seek measurements missing: %s", body)
+	}
+}
+
+func TestMountedSeekTraversalSurvivesEvictedFirstFUSERead(t *testing.T) {
+	events := []drive.MetricEvent{{Kind: "vfs_read", Phase: "read", Offset: 20267008, Bytes: 16384}}
+	const offset int64 = 20262005
+	if mountedVFSReadAtOffset(events, offset) {
+		t.Fatal("first request should be absent")
+	}
+	if !mountedVFSReadInRange(events, offset, 1<<20) {
+		t.Fatal("retained request overlaps seek range")
+	}
+	for _, start := range []int64{20267008 - (1 << 20), 20267008 + 16384} {
+		if mountedVFSReadInRange(events, start, 1<<20) {
+			t.Fatalf("disjoint range at %d matched", start)
+		}
+	}
+	events[0].Phase = "prefetch_window"
+	if mountedVFSReadInRange(events, offset, 1<<20) {
+		t.Fatal("prefetch cannot prove foreground traversal")
 	}
 }

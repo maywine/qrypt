@@ -50,7 +50,7 @@ func TestWebLoginQRExchange(t *testing.T) {
 			if req.URL.Query().Get("st") != "ticket&secret=1" || req.URL.Query().Get("lw") != "scan" {
 				t.Fatal("service ticket changed")
 			}
-			return loginResponse(req, 200, `{}`, "__kps=account; Domain=.quark.cn; Path=/", "foreign=bad; Domain=.example.com; Path=/"), nil
+			return loginResponse(req, 200, `{"success":true,"code":"OK","data":{}}`, "__kps=account; Domain=.quark.cn; Path=/", "foreign=bad; Domain=.example.com; Path=/"), nil
 		case "/1/clouddrive/config":
 			if req.Header.Get("Cookie") != "__kps=account" {
 				t.Fatalf("bootstrap cookie = %q", req.Header.Get("Cookie"))
@@ -132,6 +132,33 @@ func TestWebLoginRejectsInvalidResponsesWithoutSecrets(t *testing.T) {
 				t.Fatalf("server failure misclassified as %q", drive.ErrorCategory(err))
 			}
 		})
+	}
+}
+
+func TestWebLoginRejectsAccountFailure(t *testing.T) {
+	for _, body := range []string{
+		`{"success":false,"code":"OK","data":{"secret":"private"}}`,
+		`{"success":true,"code":"FAILED","message":"private"}`,
+		`{}`,
+	} {
+		flow := NewWebLogin()
+		flow.token = "test-token"
+		flow.expiresAt = time.Now().Add(time.Minute)
+		flow.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch req.URL.Path {
+			case "/cas/ajax/getServiceTicketByQrcodeToken":
+				return loginResponse(req, 200, `{"status":2000000,"data":{"members":{"service_ticket":"ticket"}}}`), nil
+			case "/account/info":
+				return loginResponse(req, 200, body, "__puus=private; Domain=.quark.cn; Path=/"), nil
+			default:
+				t.Fatal("continued login after account failure")
+				return nil, nil
+			}
+		})
+		result, err := flow.Poll(context.Background())
+		if !errors.Is(err, drive.ErrAuth) || result.Params != nil || strings.Contains(err.Error(), "private") {
+			t.Fatalf("account failure was accepted or exposed secrets: %v", err)
+		}
 	}
 }
 

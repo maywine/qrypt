@@ -11,7 +11,7 @@ import (
 )
 
 func TestHTTPErrorRedactsAllSensitiveFields(t *testing.T) {
-	req, err := http.NewRequest(http.MethodGet, "https://api.example.com/v1/files?access_token=tok-abc123&token=t1", nil)
+	req, err := http.NewRequest(http.MethodGet, "https://api.example.com/v1/files?access_token=tok-abc123&token=t1&password=pw-abc", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -21,7 +21,7 @@ func TestHTTPErrorRedactsAllSensitiveFields(t *testing.T) {
 	err = drive.HTTPError("quark: list", req, resp, body)
 
 	msg := err.Error()
-	for _, secret := range []string{"tok-abc123", "t1", "rt-xyz789", "https://cdn/private", "u2"} {
+	for _, secret := range []string{"tok-abc123", "t1", "pw-abc", "rt-xyz789", "https://cdn/private", "u2"} {
 		if strings.Contains(msg, secret) {
 			t.Errorf("message leaks %q: %s", secret, msg)
 		}
@@ -89,9 +89,12 @@ func TestHTTPErrorWrapsStableSentinelsByStatus(t *testing.T) {
 		class error
 	}{
 		{http.StatusUnauthorized, drive.ErrAuth},
+		{http.StatusForbidden, drive.ErrPermission},
 		{http.StatusNotFound, drive.ErrNotFound},
+		{http.StatusConflict, drive.ErrConflict},
 		{http.StatusTooManyRequests, drive.ErrRateLimit},
 		{http.StatusBadRequest, drive.ErrInvalidInput},
+		{http.StatusUnprocessableEntity, drive.ErrInvalidInput},
 	}
 	for _, tc := range cases {
 		resp := &http.Response{StatusCode: tc.code, Status: http.StatusText(tc.code)}
@@ -102,10 +105,33 @@ func TestHTTPErrorWrapsStableSentinelsByStatus(t *testing.T) {
 	}
 	resp := &http.Response{StatusCode: http.StatusInternalServerError, Status: "500 Internal Server Error"}
 	err := drive.HTTPError("quark: list", nil, resp, nil)
-	for _, sentinel := range []error{drive.ErrAuth, drive.ErrNotFound, drive.ErrRateLimit, drive.ErrInvalidInput} {
+	for _, sentinel := range []error{drive.ErrAuth, drive.ErrPermission, drive.ErrNotFound, drive.ErrConflict, drive.ErrRateLimit, drive.ErrInvalidInput} {
 		if errors.Is(err, sentinel) {
 			t.Errorf("500 error unexpectedly wraps %v: %v", sentinel, err)
 		}
+	}
+}
+
+func TestHTTPErrorMapsStatusWithPerCallOption(t *testing.T) {
+	resp := &http.Response{StatusCode: http.StatusUnprocessableEntity, Status: "422 Unprocessable Entity"}
+	err := drive.HTTPError("drime: remove", nil, resp, []byte(`{"errors":{"entryIds":["missing"]}}`),
+		drive.HTTPErrorStatusAsNotFound(http.StatusUnprocessableEntity))
+	if !errors.Is(err, drive.ErrNotFound) {
+		t.Fatalf("option did not map 422 to not found: %v", err)
+	}
+	if errors.Is(err, drive.ErrInvalidInput) {
+		t.Fatalf("option left invalid-input classification in place: %v", err)
+	}
+
+	// The option is scoped to one call and one status.
+	defaultErr := drive.HTTPError("drime: create", nil, resp, nil)
+	if !errors.Is(defaultErr, drive.ErrInvalidInput) {
+		t.Fatalf("default 422 = %v, want invalid input", defaultErr)
+	}
+	other := &http.Response{StatusCode: http.StatusConflict, Status: "409 Conflict"}
+	if !errors.Is(drive.HTTPError("drime: remove", nil, other, nil,
+		drive.HTTPErrorStatusAsNotFound(http.StatusUnprocessableEntity)), drive.ErrConflict) {
+		t.Fatal("option changed an unrelated status")
 	}
 }
 
@@ -138,6 +164,7 @@ func TestSnippetMasksSensitiveValues(t *testing.T) {
 		{"authorization bearer header", `Authorization: Bearer bearer-token-12345`, "bearer-token-12345"},
 		{"authorization plain header", `Authorization: apikey-xyz`, "apikey-xyz"},
 		{"query token", `url?token=query-token-val`, "query-token-val"},
+		{"query password", `url?password=pass-val`, "pass-val"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -212,5 +239,54 @@ func TestSnippetHandlesBinaryAndEmptyInput(t *testing.T) {
 	}
 	if out := drive.Snippet([]byte("   \n\t ")); out != "" {
 		t.Errorf("whitespace-only input = %q, want empty", out)
+	}
+}
+
+// TestHTTPErrorExposesStatusWithoutSentinel: statuses that have no dedicated
+// sentinel (5xx, 408) keep their message but carry the numeric status, which is
+// what the read path uses to decide whether a replay is worthwhile.
+func TestHTTPErrorExposesStatusWithoutSentinel(t *testing.T) {
+	cases := []int{http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusRequestTimeout}
+	for _, code := range cases {
+		resp := &http.Response{StatusCode: code, Status: http.StatusText(code)}
+		err := drive.HTTPError("koofr: read", nil, resp, nil)
+		var status *drive.HTTPStatusError
+		if !errors.As(err, &status) {
+			t.Fatalf("status %d: error %v does not expose drive.HTTPStatusError", code, err)
+		}
+		if status.Status != code {
+			t.Fatalf("status %d: HTTPStatusError.Status = %d", code, status.Status)
+		}
+		if !strings.Contains(err.Error(), http.StatusText(code)) {
+			t.Fatalf("status %d: message %q lost the status text", code, err)
+		}
+		for _, sentinel := range []error{drive.ErrAuth, drive.ErrPermission, drive.ErrNotFound, drive.ErrConflict, drive.ErrRateLimit, drive.ErrInvalidInput} {
+			if errors.Is(err, sentinel) {
+				t.Fatalf("status %d: error unexpectedly wraps %v", code, sentinel)
+			}
+		}
+	}
+}
+
+// TestHTTPErrorKeepsClassifiedStatusesUntyped: a status with a sentinel keeps
+// its existing shape, so classification rules do not change for callers that
+// already check errors.Is.
+func TestHTTPErrorKeepsClassifiedStatusesUntyped(t *testing.T) {
+	for _, tc := range []struct {
+		code int
+		want error
+	}{
+		{http.StatusUnauthorized, drive.ErrAuth},
+		{http.StatusNotFound, drive.ErrNotFound},
+		{http.StatusTooManyRequests, drive.ErrRateLimit},
+	} {
+		resp := &http.Response{StatusCode: tc.code, Status: http.StatusText(tc.code)}
+		err := drive.HTTPError("koofr: read", nil, resp, nil)
+		if !errors.Is(err, tc.want) {
+			t.Fatalf("status %d: errors.Is(%v) = false", tc.code, tc.want)
+		}
+		if errors.Is(err, drive.ErrUnsupported) {
+			t.Fatalf("status %d: unexpected unsupported classification", tc.code)
+		}
 	}
 }

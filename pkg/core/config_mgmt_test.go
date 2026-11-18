@@ -2,11 +2,18 @@ package core
 
 import (
 	"context"
-	"github.com/yinzhenyu/qrypt/pkg/util"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/yinzhenyu/qrypt/pkg/config"
+	"github.com/yinzhenyu/qrypt/pkg/core/internal/credentials"
+	"github.com/yinzhenyu/qrypt/pkg/drive"
+	"github.com/yinzhenyu/qrypt/pkg/readbudget"
+	"github.com/yinzhenyu/qrypt/pkg/util"
 )
 
 // TestApplyConfigUpdateKeepsSecretParams guards against the settings-UI round
@@ -81,6 +88,102 @@ password = "real-secret"
 
 // TestApplyConfigUpdateFieldsMerge ensures an update that mentions only some
 // params keeps the others (field-level patch semantics).
+func TestApplyConfigUpdateSharedCredential(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "qrypt.toml")
+	if err := os.WriteFile(configPath, []byte(`
+[[credentials]]
+name = "main"
+type = "quark"
+[credentials.params]
+cookie = "real-cookie"
+
+[[mounts]]
+name = "a"
+type = "quark"
+credential = "main"
+[mounts.params]
+root_path = "/A"
+
+[[mounts]]
+name = "b"
+type = "quark"
+credential = "main"
+[mounts.params]
+root_path = "/B"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := &Core{configPath: configPath}
+
+	summary, err := c.configSummary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Credentials) != 1 {
+		t.Fatalf("credentials = %+v, want one entry", summary.Credentials)
+	}
+	cred := summary.Credentials[0]
+	if cred.Name != "main" || cred.Type != "quark" {
+		t.Fatalf("credential summary = %+v", cred)
+	}
+	if cred.Params["cookie"] != maskedSecretValue {
+		t.Fatalf("cookie = %q, want masked", cred.Params["cookie"])
+	}
+	if strings.Join(cred.UsedBy, ",") != "a,b" {
+		t.Fatalf("used_by = %v, want both mounts", cred.UsedBy)
+	}
+	for _, mount := range summary.Mounts {
+		if mount.Credential != "main" {
+			t.Fatalf("mount %q credential = %q, want main", mount.Name, mount.Credential)
+		}
+	}
+
+	// Echoing the mask keeps the stored secret, while a real value replaces it.
+	if _, err := c.ApplyConfigUpdate(ConfigUpdateRequest{Credentials: []ConfigCredentialUpdate{{
+		Action: "update",
+		Name:   "main",
+		Type:   "quark",
+		Params: map[string]string{"cookie": maskedSecretValue},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `cookie = "real-cookie"`) {
+		t.Fatalf("masked echo clobbered the credential:\n%s", data)
+	}
+
+	if _, err := c.ApplyConfigUpdate(ConfigUpdateRequest{Credentials: []ConfigCredentialUpdate{{
+		Action: "update",
+		Name:   "main",
+		Type:   "quark",
+		Params: map[string]string{"cookie": "rotated-cookie"},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := c.loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	params, err := cfg.ResolveMountParams(cfg.Mounts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if params["cookie"] != "rotated-cookie" || params["root_path"] != "/B" {
+		t.Fatalf("effective params = %+v, want updated credential and mount path", params)
+	}
+
+	if _, err := c.ApplyConfigUpdate(ConfigUpdateRequest{Credentials: []ConfigCredentialUpdate{{
+		Action: "remove", Name: "main",
+	}}}); err == nil || !strings.Contains(err.Error(), "still referenced") {
+		t.Fatalf("removing a referenced credential error = %v, want a reference error", err)
+	}
+}
+
 func TestApplyConfigUpdateFieldsMerge(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()
@@ -168,7 +271,12 @@ func TestCoreReloadClosesOldCore(t *testing.T) {
 		t.Fatal(err)
 	}
 	configPath := filepath.Join(tmp, "qrypt.toml")
-	if err := os.WriteFile(configPath, []byte("[[mounts]]\nname = \"loc\"\ntype = \"localfs\"\n[mounts.params]\nroot_path = "+util.TOMLPath(remote)+"\n"), 0o644); err != nil {
+	configText := "[[mounts]]\nname = \"loc\"\ntype = \"localfs\"\n[mounts.params]\nroot_path = " + util.TOMLPath(remote) + "\n[mounts.read]\nmax_in_flight = 1\n"
+	if err := os.WriteFile(configPath, []byte(configText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const content = "reload source data"
+	if err := os.WriteFile(filepath.Join(remote, "file.txt"), []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -180,6 +288,23 @@ func TestCoreReloadClosesOldCore(t *testing.T) {
 	if old.cleanup == nil {
 		t.Fatal("old core should be open")
 	}
+	defer old.Close(ctx)
+	oldSource := old.fs.(drive.MountReadSourceProvider).ReadSourceForMount("loc")
+	entry, err := old.Stat(ctx, "/loc/file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := oldSource.OpenRange(ctx, entry, 0, int64(len(content)), readbudget.PriorityNormal, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer body.Close()
+	if oldSource.Scheduler().PerFileInUse(entry.ID) != 1 {
+		t.Fatal("old source must hold the in-flight body admission")
+	}
+	if err := os.WriteFile(configPath, []byte(strings.Replace(configText, "max_in_flight = 1", "max_in_flight = 2", 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	reloaded, err := old.Reload(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -190,5 +315,67 @@ func TestCoreReloadClosesOldCore(t *testing.T) {
 	}
 	if old.fs != nil {
 		t.Fatal("Reload must detach the old core's filesystem")
+	}
+	if oldSource.Scheduler().PerFileInUse(entry.ID) != 0 {
+		t.Fatal("Reload must release old source body admission")
+	}
+	if _, err := oldSource.OpenRange(ctx, entry, 0, 1, readbudget.PriorityNormal, false); !errors.Is(err, drive.ErrReadSourceClosed) {
+		t.Fatalf("old source accepted a read after reload: %v", err)
+	}
+	newSource := reloaded.fs.(drive.MountReadSourceProvider).ReadSourceForMount("loc")
+	if newSource == oldSource || newSource.Policy().SourceID == oldSource.Policy().SourceID {
+		t.Fatal("Reload must create a new source identity")
+	}
+	if oldSource.Policy().Effective.MaxInFlight != 1 || newSource.Policy().Effective.MaxInFlight != 2 {
+		t.Fatal("Reload must apply new policy without mutating old source policy")
+	}
+	newBody, err := newSource.Read(ctx, entry, 0, int64(len(content)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer newBody.Close()
+	data, err := io.ReadAll(newBody)
+	if err != nil || string(data) != content {
+		t.Fatalf("new source read = %q, %v", data, err)
+	}
+}
+
+func TestConfigSummaryCredentialLifecycle(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	configPath := filepath.Join(tmp, "qrypt.toml")
+	cfg := &config.Config{
+		Storage: config.StorageConfig{WorkDir: tmp},
+		Credentials: []config.CredentialConfig{{
+			Name: "main", Type: "quark", Params: config.ParamMap{"cookie": "k=v"},
+		}},
+		Mounts: []config.MountConfig{{
+			Name: "docs", Type: "quark", Credential: "main",
+			Params: config.ParamMap{"root_path": "/Docs"},
+		}},
+	}
+	if err := config.Save(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	layout := NewStorageLayout(cfg, RuntimeLayout{})
+	session := credentials.Open(layout.StateDir).Session(credentials.Spec{
+		Name:       "main",
+		ParamsSeed: credentials.ParamsSeed("quark", cfg.Credentials[0].Params),
+	})
+	if _, err := session.Update(0, []byte(`{"cookie":"rotated"}`), "account-a"); err != nil {
+		t.Fatal(err)
+	}
+
+	c := &Core{configPath: configPath, runtimeLayout: layout}
+	summary, err := c.configSummary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Credentials) != 1 {
+		t.Fatalf("credentials = %+v, want one entry", summary.Credentials)
+	}
+	entry := summary.Credentials[0]
+	if entry.Source != "state" || entry.Version != 1 || entry.Account != "account-a" || entry.UpdatedAt.IsZero() {
+		t.Fatalf("credential lifecycle summary = %+v", entry)
 	}
 }

@@ -207,6 +207,7 @@ type vfsDebugSnapshotRuntime struct {
 	uploadSnapshots       func([]PendingUpload) []uploadSnapshot
 	uploadSnapshotHistory func() []uploadSnapshot
 	debugHotChunks        func() (int, int64)
+	readSource            *drive.ReadSource
 }
 
 func newVFSDebugSnapshotRuntime(v *VFS) vfsDebugSnapshotRuntime {
@@ -223,6 +224,7 @@ func newVFSDebugSnapshotRuntime(v *VFS) vfsDebugSnapshotRuntime {
 		uploadSnapshots:       v.uploadSnapshots,
 		uploadSnapshotHistory: v.uploadSnapshotHistory,
 		debugHotChunks:        v.debugHotChunks,
+		readSource:            v.readSource,
 	}
 }
 
@@ -280,6 +282,9 @@ func (r vfsDebugSnapshotRuntime) Overlay() diagnostics.OverlaySnapshot {
 	for _, path := range snap.DeleteTimers {
 		out.DeleteTimers = append(out.DeleteTimers, diagnostics.DebugTimer{Path: path})
 	}
+	for _, path := range snap.ActiveDeletes {
+		out.ActiveDeletes = append(out.ActiveDeletes, diagnostics.DebugTimer{Path: path})
+	}
 	for _, d := range snap.Deleted {
 		out.Deleted = append(out.Deleted, diagnostics.DebugDeletedEntry{
 			Path: d.Path, ID: d.ID, Name: d.Name, IsDir: d.IsDir, Size: d.Size,
@@ -321,6 +326,13 @@ func (r vfsDebugSnapshotRuntime) UploadHistory() []uploadSnapshot {
 	return r.uploadSnapshotHistory()
 }
 
+func (r vfsDebugSnapshotRuntime) ReadPolicy() drive.ResolvedReadPolicy {
+	if r.readSource == nil {
+		return drive.ResolvedReadPolicy{}
+	}
+	return r.readSource.Policy()
+}
+
 func (r vfsDebugSnapshotRuntime) StartedAt() time.Time {
 	return DebugStartedAt()
 }
@@ -331,6 +343,19 @@ func (r vfsDebugSnapshotRuntime) Runtime() diagnostics.RuntimeSnapshot {
 		RangeHitLimit: read.RangeHitLimit,
 	}
 	out.WindowLoads, out.Prefetches, out.RangeHitCount = r.read.RuntimeStats()
+	foregroundTimeouts, prefetchTimeouts, lastTimeout := r.read.TimeoutStats()
+	out.ReadTimeouts = foregroundTimeouts
+	out.PrefetchTimeouts = prefetchTimeouts
+	if lastTimeout != nil {
+		out.LastTimeout = &diagnostics.DebugReadTimeout{
+			CacheKey:    lastTimeout.CacheKey,
+			WindowStart: lastTimeout.Start,
+			WindowEnd:   lastTimeout.End,
+			Background:  lastTimeout.Background,
+			Kind:        string(lastTimeout.Kind),
+			At:          lastTimeout.At,
+		}
+	}
 	out.HotChunkCount, out.HotChunkBytes = r.debugHotChunks()
 	out.Counters = r.counters.Snapshot()
 	return out

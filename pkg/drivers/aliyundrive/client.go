@@ -35,14 +35,18 @@ type client struct {
 	apiBaseURL string
 	authURL    string
 
-	mu           sync.RWMutex
-	accessToken  string
-	refreshToken string
-	userID       string
-	deviceID     string
-	signature    string
-	onRefresh    func(accessToken, refreshToken string)
-	metrics      *driverutil.Buffer
+	mu              sync.RWMutex
+	accessToken     string
+	refreshToken    string
+	accessExpiresAt time.Time
+	userID          string
+	deviceID        string
+	signature       string
+	onRefresh       func(accessToken, refreshToken string)
+	// authRefresh, when set, performs the refresh through the shared credential
+	// session so concurrent mounts coalesce into one provider call.
+	authRefresh func(ctx context.Context, force bool) error
+	metrics     *driverutil.Buffer
 }
 
 type clientOptions struct {
@@ -80,6 +84,22 @@ func (c *client) tokens() (accessToken, refreshToken string) {
 }
 
 func (c *client) refresh(ctx context.Context) error {
+	if c.authRefresh != nil {
+		return c.authRefresh(ctx, false)
+	}
+	return c.refreshDirect(ctx)
+}
+
+// refreshForced refreshes even when the access token still looks fresh; the
+// provider has already rejected it (for example AccessTokenInvalid).
+func (c *client) refreshForced(ctx context.Context) error {
+	if c.authRefresh != nil {
+		return c.authRefresh(ctx, true)
+	}
+	return c.refreshDirect(ctx)
+}
+
+func (c *client) refreshDirect(ctx context.Context) error {
 	_, refreshToken := c.tokens()
 	if refreshToken == "" {
 		return fmt.Errorf("aliyundrive: refresh token is required")
@@ -98,6 +118,11 @@ func (c *client) refresh(ctx context.Context) error {
 	c.mu.Lock()
 	c.accessToken = resp.AccessToken
 	c.refreshToken = resp.RefreshToken
+	if resp.ExpiresIn > 0 {
+		c.accessExpiresAt = time.Now().Add(time.Duration(resp.ExpiresIn) * time.Second)
+	} else {
+		c.accessExpiresAt = time.Time{}
+	}
 	c.mu.Unlock()
 	if c.onRefresh != nil {
 		c.onRefresh(resp.AccessToken, resp.RefreshToken)
@@ -116,6 +141,20 @@ func (c *client) setTokens(accessToken, refreshToken string) {
 	}
 }
 
+// setTokensWithExpiry restores a persisted pair together with its expiry.
+func (c *client) setTokensWithExpiry(accessToken, refreshToken string, expiresAt time.Time) {
+	c.setTokens(accessToken, refreshToken)
+	c.mu.Lock()
+	c.accessExpiresAt = expiresAt
+	c.mu.Unlock()
+}
+
+func (c *client) tokenExpiry() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.accessExpiresAt
+}
+
 func (c *client) request(ctx context.Context, method, path string, body, result any) error {
 	url := path
 	if strings.HasPrefix(path, "/") {
@@ -128,7 +167,7 @@ func (c *client) request(ctx context.Context, method, path string, body, result 
 	}
 	switch apiErr.code {
 	case "AccessTokenInvalid":
-		if refreshErr := c.refresh(ctx); refreshErr != nil {
+		if refreshErr := c.refreshForced(ctx); refreshErr != nil {
 			return refreshErr
 		}
 		return c.rawJSON(ctx, method, url, c.currentAccessToken(), body, result)

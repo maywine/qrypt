@@ -6,12 +6,15 @@ import (
 	"github.com/spf13/cobra"
 	cliconfig "github.com/yinzhenyu/qrypt/internal/cli/config"
 	clicontrol "github.com/yinzhenyu/qrypt/internal/cli/control"
+	clicredential "github.com/yinzhenyu/qrypt/internal/cli/credential"
 	clidebug "github.com/yinzhenyu/qrypt/internal/cli/debug"
 	clidriver "github.com/yinzhenyu/qrypt/internal/cli/driver"
 	clifs "github.com/yinzhenyu/qrypt/internal/cli/fs"
 	"github.com/yinzhenyu/qrypt/internal/cli/i18n"
 	climount "github.com/yinzhenyu/qrypt/internal/cli/mount"
 	clioffline "github.com/yinzhenyu/qrypt/internal/cli/offline"
+	clireceive "github.com/yinzhenyu/qrypt/internal/cli/receive"
+	clishare "github.com/yinzhenyu/qrypt/internal/cli/share"
 	cliuninstall "github.com/yinzhenyu/qrypt/internal/cli/uninstall"
 	cliupgrade "github.com/yinzhenyu/qrypt/internal/cli/upgrade"
 	cliversion "github.com/yinzhenyu/qrypt/internal/cli/version"
@@ -55,12 +58,15 @@ then the platform config directory: $XDG_CONFIG_HOME/qrypt/qrypt.toml
 
 	cmd.AddCommand(climount.NewCommand(cliRuntime{}))
 	cmd.AddCommand(cliconfig.NewCommand(cliRuntime{}))
+	cmd.AddCommand(clicredential.NewCommand(cliRuntime{}))
 	cmd.AddCommand(clidriver.NewCommand(cliRuntime{}))
 	cmd.AddCommand(clifs.NewCommand(cliRuntime{}))
 	cmd.AddCommand(clidebug.NewCommand(cliRuntime{}))
 	cmd.AddCommand(clidebug.NewProbeCommand(cliRuntime{}))
 	cmd.AddCommand(clicontrol.NewCommand(cliRuntime{}))
 	cmd.AddCommand(clioffline.NewCommand(cliRuntime{}))
+	cmd.AddCommand(clishare.NewCommand(cliRuntime{}))
+	cmd.AddCommand(clireceive.NewCommand(cliRuntime{}))
 	cmd.AddCommand(cliupgrade.NewCommand(cliRuntime{}, build))
 	cmd.AddCommand(cliuninstall.NewCommand(cliRuntime{}))
 	cmd.AddCommand(cliversion.NewCommand(cliRuntime{}, build))

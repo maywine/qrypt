@@ -18,24 +18,17 @@ permissions:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          # go.mod is the single source of truth for the pinned toolchain.
+          go-version-file: go.mod
           cache: true
 
       - name: Install FUSE headers
-        run: |
-          # The runner image usually already ships libfuse3-dev, and apt-get
-          # update is the slow half of this step; only reach for apt when the
-          # headers the cgo build actually needs are missing.
-          if pkg-config --exists fuse3; then
-            echo "libfuse3-dev already present"
-            exit 0
-          fi
-          sudo apt-get update
-          sudo apt-get install -y libfuse3-dev fuse3
+        uses: ./.github/actions/setup-fuse
 
       - name: Fuzz (30s per fuzzer)
         run: scripts/ci/fuzz-nightly.sh 30s
@@ -45,7 +38,7 @@ jobs:
       # instead of letting them vanish with the runner.
       - name: Collect fuzz corpus
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fuzz-corpus
           path: |
@@ -55,28 +48,21 @@ jobs:
   gate:
     name: Nightly gate (${{ matrix.name }})
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         name: [coverage, race, regression]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          # go.mod is the single source of truth for the pinned toolchain.
+          go-version-file: go.mod
           cache: true
 
       - name: Install FUSE headers
-        run: |
-          # The runner image usually already ships libfuse3-dev, and apt-get
-          # update is the slow half of this step; only reach for apt when the
-          # headers the cgo build actually needs are missing.
-          if pkg-config --exists fuse3; then
-            echo "libfuse3-dev already present"
-            exit 0
-          fi
-          sudo apt-get update
-          sudo apt-get install -y libfuse3-dev fuse3
+        uses: ./.github/actions/setup-fuse
 
       - name: Coverage gate
         if: matrix.name == 'coverage'
@@ -98,17 +84,19 @@ jobs:
   windows-mount:
     name: Windows mount smoke
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.27.3"
+          # go.mod is the single source of truth for the pinned toolchain.
+          go-version-file: go.mod
           cache: true
 
       # Hosted runners are fresh each time: cache the pinned MSI, but install
       # the driver on every run. The script verifies its SHA-256 before use.
       - name: Cache WinFsp MSI
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: .cache/winfsp/winfsp-2.1.25156.msi
           key: winfsp-msi-windows-2.1.25156-073a70e00f77423e

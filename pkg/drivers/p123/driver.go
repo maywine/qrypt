@@ -2,6 +2,7 @@ package p123
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/yinzhenyu/qrypt/pkg/drive"
 	"github.com/yinzhenyu/qrypt/pkg/drive/session"
+	"github.com/yinzhenyu/qrypt/pkg/drivers/internal/driverutil"
 	"github.com/yinzhenyu/qrypt/pkg/logging"
 )
 
@@ -49,6 +51,13 @@ type Driver struct {
 	tokenStateMu sync.Mutex
 	tokenSource  string
 	tokenUpdated time.Time
+
+	// cred owns the shared-session lifecycle for mounts that reference a
+	// [[credentials]] entry; nil keeps the legacy per-mount token state.
+	cred *driverutil.CredentialBinding[credentialPayload]
+	// suppressCommit stops the login callback from committing while loginDirect
+	// mints the token that loginShared commits itself.
+	suppressCommit atomic.Bool
 
 	// Upload session bindings: content key → provider upload handle, used to
 	// resume interrupted multipart uploads.
@@ -98,13 +107,23 @@ func New(opts Options) *Driver {
 		urlCache:    map[string]cachedDownload{},
 	}
 	d.cl.onTokenUpdate = d.saveToken
+	d.cred = driverutil.NewCredentialBinding("123", decodeCredentialPayload, d.applyCredentialBinding)
 	return d
 }
 
 func (d *Driver) Init(ctx context.Context) error {
-	d.loadTokenState()
+	if d.cred.Session() != nil {
+		d.loadCredentialSession()
+		d.subscribeCredentialSession()
+	} else {
+		d.loadTokenState()
+	}
 	if d.cl.tokenValue() == "" {
-		if err := d.cl.login(ctx); err != nil {
+		login := d.cl.login
+		if d.cred.Session() != nil {
+			login = d.loginShared
+		}
+		if err := login(ctx); err != nil {
 			return err
 		}
 	}
@@ -131,6 +150,7 @@ func (d *Driver) Init(ctx context.Context) error {
 }
 
 func (d *Driver) Drop(ctx context.Context) error {
+	d.cred.Close()
 	d.sessionStoreMu.Lock()
 	if d.sessionCancel != nil {
 		d.sessionCancel()
@@ -404,6 +424,13 @@ func (d *Driver) DebugSnapshot(ctx context.Context) (drive.DebugSnapshot, error)
 	tokenSource := d.tokenSource
 	tokenUpdated := d.tokenUpdated
 	d.tokenStateMu.Unlock()
+	extra := map[string]any{
+		drive.DebugExtraInstantUploadCount: d.instantUploads.Load(),
+		drive.DebugExtraCredentialSource:   tokenSource,
+		drive.DebugExtraCredentialUpdated:  tokenUpdated,
+		drive.DebugExtraLastError:          lastErr,
+	}
+	d.cred.Debug(extra)
 	return drive.DebugSnapshot{
 		Driver:      "123",
 		Health:      health,
@@ -414,12 +441,7 @@ func (d *Driver) DebugSnapshot(ctx context.Context) (drive.DebugSnapshot, error)
 			"cached_download_urls":  urlCount,
 			"token_relogins":        d.cl.reloginCount.Load(),
 		},
-		Extra: map[string]any{
-			drive.DebugExtraInstantUploadCount: d.instantUploads.Load(),
-			drive.DebugExtraCredentialSource:   tokenSource,
-			drive.DebugExtraCredentialUpdated:  tokenUpdated,
-			drive.DebugExtraLastError:          lastErr,
-		},
+		Extra: extra,
 	}, nil
 }
 
@@ -475,6 +497,13 @@ func (d *Driver) saveToken(token string, expire time.Time) {
 	d.tokenSource = "login"
 	d.tokenUpdated = updated
 	d.tokenStateMu.Unlock()
+	if d.cred.Session() != nil {
+		if d.suppressCommit.Load() {
+			return
+		}
+		d.commitCredentialToken(token, expire)
+		return
+	}
 	if d.stateStore == nil {
 		return
 	}
@@ -486,6 +515,130 @@ func (d *Driver) saveToken(token string, expire time.Time) {
 	}); err != nil {
 		logging.L.Warnf("[123] save token state failed: %v", err)
 	}
+}
+
+func (d *Driver) loadCredentialSession() {
+	d.cred.Load()
+}
+
+func (d *Driver) subscribeCredentialSession() {
+	d.cred.Subscribe()
+}
+
+// applyCredentialBinding applies one decoded payload to the client, rejecting
+// tokens minted for another account or already past their expiry.
+func (d *Driver) applyCredentialBinding(payload credentialPayload, snapshot drive.CredentialSnapshot, source string) bool {
+	if payload.Token == "" || payload.Username != d.cl.username {
+		return false
+	}
+	if !payload.Expire.IsZero() && time.Now().After(payload.Expire) {
+		return false
+	}
+	d.cl.setToken(payload.Token)
+	d.tokenStateMu.Lock()
+	d.tokenSource = source
+	d.tokenUpdated = snapshot.UpdatedAt
+	d.tokenStateMu.Unlock()
+	return true
+}
+
+// loginShared returns an unexpired token from the session or performs one login
+// for every mount waiting on the same credential.
+func (d *Driver) loginShared(ctx context.Context) error {
+	if snapshot := d.cred.Snapshot(); len(snapshot.Payload) > 0 {
+		if _, err := decodeCredentialPayload(snapshot.Payload); err != nil {
+			logging.L.Warnf("[123] corrupt shared credential, falling back to login: %v", err)
+			token, expire, loginErr := d.loginDirect(ctx)
+			if loginErr != nil {
+				return loginErr
+			}
+			encoded, encodeErr := encodeCredentialPayload(credentialPayload{
+				Token:    token,
+				Username: d.cl.username,
+				Expire:   expire,
+			})
+			if encodeErr != nil {
+				return encodeErr
+			}
+			return d.cred.Replace(encoded, d.cl.username)
+		}
+	}
+	_, err := d.cred.Refresh(ctx, func(payload credentialPayload, snapshot drive.CredentialSnapshot) ([]byte, string, error) {
+		if payload.Token != "" && payload.Username == d.cl.username &&
+			(payload.Expire.IsZero() || time.Now().Before(payload.Expire)) {
+			d.cl.setToken(payload.Token)
+			return snapshot.Payload, d.cl.username, nil
+		}
+		token, expire, loginErr := d.loginDirect(ctx)
+		if loginErr != nil {
+			return nil, "", loginErr
+		}
+		encoded, encodeErr := encodeCredentialPayload(credentialPayload{
+			Token:    token,
+			Username: d.cl.username,
+			Expire:   expire,
+		})
+		if encodeErr != nil {
+			return nil, "", encodeErr
+		}
+		return encoded, d.cl.username, nil
+	})
+	return err
+}
+
+// loginDirect runs the password login and reports the minted token without
+// committing it; loginShared commits the result as one session update.
+func (d *Driver) loginDirect(ctx context.Context) (string, time.Time, error) {
+	var token string
+	var expire time.Time
+	previous := d.cl.onTokenUpdate
+	d.cl.onTokenUpdate = func(minted string, exp time.Time) {
+		token, expire = minted, exp
+		if previous != nil {
+			previous(minted, exp)
+		}
+	}
+	d.suppressCommit.Store(true)
+	err := d.cl.login(ctx)
+	d.suppressCommit.Store(false)
+	d.cl.onTokenUpdate = previous
+	return token, expire, err
+}
+
+func (d *Driver) commitCredentialToken(token string, expire time.Time) {
+	if d.cred.Session() == nil || token == "" {
+		return
+	}
+	payload, err := encodeCredentialPayload(credentialPayload{
+		Token:    token,
+		Username: d.cl.username,
+		Expire:   expire,
+	})
+	if err != nil {
+		return
+	}
+	if err := d.cred.Commit(payload, d.cl.username); err != nil && !errors.Is(err, drive.ErrCredentialVersionConflict) {
+		logging.L.Warnf("[123] commit shared credential failed: %v", err)
+	}
+}
+
+type credentialPayload struct {
+	Token    string    `json:"token,omitempty"`
+	Username string    `json:"username,omitempty"`
+	Expire   time.Time `json:"expire,omitempty"`
+}
+
+func encodeCredentialPayload(payload credentialPayload) ([]byte, error) {
+	return json.Marshal(payload)
+}
+
+func decodeCredentialPayload(data []byte) (credentialPayload, error) {
+	var payload credentialPayload
+	if len(data) == 0 {
+		return payload, nil
+	}
+	err := json.Unmarshal(data, &payload)
+	return payload, err
 }
 
 func errIsNotFound(err error) bool {
@@ -503,4 +656,10 @@ var _ drive.StateStoreInstaller = (*Driver)(nil)
 func (d *Driver) InstallStateStore(store drive.StateStore) {
 	d.stateStore = store
 	d.installSessionIndex(store)
+}
+
+// InstallCredentialSession lets every mount of one configured 123 credential
+// share one token and coalesce logins.
+func (d *Driver) InstallCredentialSession(session drive.CredentialSession) {
+	d.cred.Install(session)
 }

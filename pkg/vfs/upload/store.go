@@ -128,9 +128,12 @@ type PendingStore struct {
 
 	// journalFail, when non-nil, injects a failure into journal appends;
 	// compactFail injects one into compactions (test-only hooks for
-	// write-ahead fault injection).
-	journalFail func() error
-	compactFail func() error
+	// write-ahead fault injection). afterJournalSync, when non-nil, runs after
+	// every journal write became durable; tests use it to model a slow disk and
+	// check that the scheduling anchors stay on the right side of the append.
+	journalFail      func() error
+	compactFail      func() error
+	afterJournalSync func()
 
 	// compactMaxBytes / compactMaxEntries tune when the journal is rewritten
 	// from the in-memory pending set. NewPendingStore seeds them from the
@@ -151,10 +154,15 @@ type PendingStore struct {
 // no-durability mode tests use. Every journal write goes through here so the
 // durability story has exactly one place to read.
 func (c *PendingStore) syncJournalFile(f *os.File) error {
-	if c.skipJournalSync {
-		return nil
+	if !c.skipJournalSync {
+		if err := f.Sync(); err != nil {
+			return err
+		}
 	}
-	return f.Sync()
+	if c.afterJournalSync != nil {
+		c.afterJournalSync()
+	}
+	return nil
 }
 
 type JournalEntry struct {
@@ -331,20 +339,47 @@ func (c *PendingStore) saveUpload(p PendingUpload) error {
 		return err
 	}
 	c.mu.Lock()
-	c.pending[p.Path] = p
-	if p.FID != "" {
-		c.idIndex[p.FID] = p.Path
-	}
+	c.applyLocked(p)
 	c.mu.Unlock()
 	return nil
 }
-func (c *PendingStore) UpdateUploadTransient(p PendingUpload) {
-	p.UpdatedAt = util.Now().UnixNano()
-	c.mu.Lock()
+
+// applyLocked installs p as the current in-memory record and stamps the
+// scheduling anchor (PendingUpload.AppliedAt). Every state change that
+// scheduling may key off goes through here, and the stamp is taken after the
+// journal append returned: the anchor deliberately measures when the state
+// became current, not when its timestamp was computed. Callers hold c.mu.
+func (c *PendingStore) applyLocked(p PendingUpload) {
+	p.AppliedAt = time.Now()
+	// Any state change re-arms the normal scheduling floors: a grant from an
+	// explicit user retry only applies to the state it was granted for.
+	p.RunNow = false
 	c.pending[p.Path] = p
 	if p.FID != "" {
 		c.idIndex[p.FID] = p.Path
 	}
+}
+
+// RunNow grants an explicit user retry for the current generation: scheduling
+// skips the quiet window and the retry backoff until the record's next state
+// change (see applyLocked). It is in-memory only - a restart is itself a wait
+// longer than any floor - and it does not touch the journal.
+func (c *PendingStore) RunNow(p PendingUpload) (PendingUpload, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	current, ok := c.pending[p.Path]
+	if !ok || (p.FID != "" && current.FID != p.FID) {
+		return PendingUpload{}, false
+	}
+	current.RunNow = true
+	c.pending[p.Path] = current
+	return current, true
+}
+
+func (c *PendingStore) UpdateUploadTransient(p PendingUpload) {
+	p.UpdatedAt = util.Now().UnixNano()
+	c.mu.Lock()
+	c.applyLocked(p)
 	c.mu.Unlock()
 }
 
@@ -412,7 +447,7 @@ func (c *PendingStore) TryReuseFrozenStaging(p PendingUpload) (PendingUpload, bo
 	// Bumping UpdatedAt retires any queued or scheduled attempt of this
 	// generation: the worker drops a record that no longer matches the store.
 	current.UpdatedAt = util.Now().UnixNano()
-	c.pending[p.Path] = current
+	c.applyLocked(current)
 	return current, true
 }
 
@@ -436,7 +471,7 @@ func (c *PendingStore) RecordUploadReplacementIfUnchanged(p PendingUpload, uploa
 		return pending, true, err
 	}
 	c.mu.Lock()
-	c.pending[p.Path] = next
+	c.applyLocked(next)
 	c.mu.Unlock()
 	return next, true, nil
 }
@@ -471,7 +506,7 @@ func (c *PendingStore) RecordUploadFailureIfUnchanged(p PendingUpload, err error
 		return current, true, err
 	}
 	c.mu.Lock()
-	c.pending[p.Path] = next
+	c.applyLocked(next)
 	c.mu.Unlock()
 	return next, true, nil
 }
@@ -502,7 +537,7 @@ func (c *PendingStore) RecordUploadPermanentFailureIfUnchanged(p PendingUpload, 
 		return current, true, err
 	}
 	c.mu.Lock()
-	c.pending[p.Path] = next
+	c.applyLocked(next)
 	c.mu.Unlock()
 	return next, true, nil
 }
@@ -748,10 +783,7 @@ func (c *PendingStore) renameUploadLocked(oldPath string, next PendingUpload) er
 		delete(c.idIndex, old.FID)
 	}
 	delete(c.pending, oldPath)
-	c.pending[next.Path] = next
-	if next.FID != "" {
-		c.idIndex[next.FID] = next.Path
-	}
+	c.applyLocked(next)
 	c.mu.Unlock()
 	return nil
 }
@@ -1060,12 +1092,27 @@ func ReplayUploadJournal(dir string) ([]PendingUpload, error) {
 	return replayed, nil
 }
 
+// PruneOptions controls which journal entries PruneUploadJournal drops.
+type PruneOptions struct {
+	// IncludePermanentFailures also drops permanently failed uploads. Their
+	// staging data is deleted when the pruned journal has been written, so
+	// an explicit opt-in is required: a permanent failure may still be
+	// recoverable with ReplayUploadJournal after credentials are fixed.
+	IncludePermanentFailures bool
+}
+
 // PruneUploadJournal rewrites the journal to only the current pending set:
 // entries are replayed by path (dirty overrides, clean removes) and then
 // dirty entries whose staging file is gone or size-mismatched are dropped,
 // since their offline data no longer exists. Terminal clean markers and
 // corrupt lines are dropped. It returns the number of dropped entries.
 func PruneUploadJournal(dir string) (int, error) {
+	return PruneUploadJournalWithOptions(dir, PruneOptions{})
+}
+
+// PruneUploadJournalWithOptions is PruneUploadJournal with explicit
+// selection of terminal states to discard.
+func PruneUploadJournalWithOptions(dir string, opts PruneOptions) (int, error) {
 	journalPath := filepath.Join(dir, "pending.jsonl")
 	file, err := os.Open(journalPath)
 	if os.IsNotExist(err) {
@@ -1111,8 +1158,16 @@ func PruneUploadJournal(dir string) (int, error) {
 	}
 
 	// Drop entries whose staging data is gone; what remains is the kept set.
+	// Permanently failed entries are only dropped on explicit request and
+	// their staging files are removed after the journal rewrite succeeds.
 	var kept []JournalEntry
+	var droppedStaging []string
 	for _, entry := range pending {
+		if opts.IncludePermanentFailures && entry.PermanentFail {
+			pruned++
+			droppedStaging = append(droppedStaging, entry.LocalPath)
+			continue
+		}
 		info, statErr := os.Stat(entry.LocalPath)
 		if statErr != nil || info.Size() != entry.Size {
 			pruned++
@@ -1156,6 +1211,18 @@ func PruneUploadJournal(dir string) (int, error) {
 		return pruned, err
 	}
 	_ = syncParentDir(journalPath)
+	// The journal no longer references these staging files. Removing them
+	// after the rename keeps a failed prune from destroying data that a
+	// still-live journal entry points at; a leftover file on error is only
+	// an orphan the next cleanup can sweep.
+	for _, localPath := range droppedStaging {
+		if localPath == "" {
+			continue
+		}
+		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+			logging.L.Warnf("[CACHE] prune failed upload staging failed local=%q err=%v", localPath, err)
+		}
+	}
 	return pruned, nil
 }
 

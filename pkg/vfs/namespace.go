@@ -188,6 +188,12 @@ type HashProvider interface {
 	RemoteHash(ctx context.Context, path string) (drive.HashAlgorithm, string, error)
 }
 
+// ProvenanceHashProvider reports a backend hash with its provenance. A caller
+// that receives only HashProvider data must treat the hash as declared.
+type ProvenanceHashProvider interface {
+	RemoteHashInfo(ctx context.Context, path string) (drive.RemoteHashInfo, error)
+}
+
 // EncryptedHashProvider computes the hash the plaintext would have when
 // encrypted with the mount's cipher (nonce from the remote header).
 type EncryptedHashProvider interface {
@@ -417,6 +423,45 @@ func (n *Namespace) resolve(path string) (*VFS, string, bool, error) {
 		return nil, "", false, fmt.Errorf("%w: unknown mount %q", ErrNotFound, name)
 	}
 	return mount, rest, false, nil
+}
+
+// SetReadPlanOverride applies a measurement-only override to one mount.
+func (n *Namespace) SetReadPlanOverride(mount string, maxStreams int, windowBytes int64, idle, total time.Duration) error {
+	name := vfstypes.CleanMountName(mount)
+	n.mu.RLock()
+	fs := n.mounts[name]
+	n.mu.RUnlock()
+	if fs == nil {
+		return fmt.Errorf("vfs: unknown mount %q", name)
+	}
+	return fs.SetReadPlanOverride("", maxStreams, windowBytes, idle, total)
+}
+
+// ClearReadPlanOverride removes the measurement override from every mount.
+func (n *Namespace) ClearReadPlanOverride() {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	for _, fs := range n.mounts {
+		fs.ClearReadPlanOverride()
+	}
+}
+
+func (n *Namespace) ReadSourceForPath(path string) *drive.ReadSource {
+	mount, rest, isRoot, err := n.resolve(path)
+	if err != nil || isRoot {
+		return nil
+	}
+	return mount.ReadSourceForPath(rest)
+}
+func (n *Namespace) ReadSourceForMount(name string) *drive.ReadSource {
+	name = vfstypes.CleanMountName(name)
+	n.mu.RLock()
+	mount := n.mounts[name]
+	n.mu.RUnlock()
+	if mount == nil {
+		return nil
+	}
+	return mount.ReadSourceForMount(name)
 }
 
 func (n *Namespace) rootEntries() []drive.Entry {

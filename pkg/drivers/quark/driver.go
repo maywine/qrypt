@@ -3,8 +3,12 @@ package quark
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +19,7 @@ import (
 
 	"github.com/yinzhenyu/qrypt/pkg/drive"
 	"github.com/yinzhenyu/qrypt/pkg/drive/session"
+	"github.com/yinzhenyu/qrypt/pkg/drivers/internal/driverutil"
 )
 
 func init() {
@@ -62,23 +67,34 @@ func New(cookie string, opts Options) *Driver {
 		rootID = "0"
 	}
 	d := &Driver{
-		cl:               newClient(cookie, clientOptions{BaseURL: opts.BaseURL, V2URL: opts.V2URL, WGKeys: opts.WGKeys}),
-		cookie:           cookie,
-		rootPath:         opts.RootPath,
-		rootID:           rootID,
-		cookieSource:     "config",
-		debugUploads:     map[string]quarkUploadDebug{},
-		wgKeys:           opts.WGKeys,
-		offlineSessions:  map[string]string{},
-		configCookieHash: fmt.Sprintf("%x", sha256.Sum256([]byte(cookie))),
+		cl:                newClient(cookie, clientOptions{BaseURL: opts.BaseURL, V2URL: opts.V2URL, WGKeys: opts.WGKeys}),
+		cookie:            cookie,
+		configCookie:      cookie,
+		configCookieHash:  fmt.Sprintf("%x", sha256.Sum256([]byte(cookie))),
+		rootPath:          opts.RootPath,
+		rootID:            rootID,
+		cookieSource:      "config",
+		debugUploads:      map[string]quarkUploadDebug{},
+		wgKeys:            opts.WGKeys,
+		offlineSessions:   map[string]string{},
+		sharePollTimeout:  quarkSharePollTimeout,
+		sharePollInterval: quarkSharePollInterval,
+		shareSaves:        map[string][]drive.ShareEntry{},
 	}
 	d.cl.onCookieUpdate = d.saveUpdatedCookie
+	d.cl.onAuthRetry = d.recoverCredential
+	d.cred = driverutil.NewCredentialBinding("quark", decodeCredentialPayload, d.applyCredentialBinding)
 	return d
 }
 
 func (d *Driver) Init(ctx context.Context) error {
 	configCookie := d.cookie
-	d.loadCookieState()
+	if d.cred.Session() != nil {
+		d.loadCredentialSession()
+		d.subscribeCredentialSession()
+	} else {
+		d.loadCookieState()
+	}
 	if d.cookie == "" {
 		return fmt.Errorf("quark: cookie is required")
 	}
@@ -101,10 +117,21 @@ func (d *Driver) Init(ctx context.Context) error {
 		}
 		d.rootID = rootID
 	}
+	// A config cookie that just authenticated replaces whatever rotation state
+	// belongs to a previous credential; record it so siblings and later starts
+	// reuse the working value.
+	if d.cookieSource == "config" {
+		if d.cred.Session() == nil {
+			d.persistCookieState(d.cookie, "config")
+		} else if len(d.cred.Snapshot().Payload) == 0 {
+			d.commitCredentialCookie(d.cookie)
+		}
+	}
 	return nil
 }
 
 func (d *Driver) Drop(ctx context.Context) error {
+	d.cred.Close()
 	d.sessionStoreMu.Lock()
 	if d.sessionCancel != nil {
 		d.sessionCancel()
@@ -127,6 +154,12 @@ func (d *Driver) InstallBandwidthLimiter(limiter *drive.BandwidthLimiter) drive.
 	return drive.BandwidthLimitDownload | drive.BandwidthLimitUpload
 }
 
+// InstallCredentialSession lets every mount of one configured credential share
+// a single rotated cookie.
+func (d *Driver) InstallCredentialSession(session drive.CredentialSession) {
+	d.cred.Install(session)
+}
+
 type Driver struct {
 	drive.UnsupportedOperations
 	cl                 *client
@@ -135,11 +168,18 @@ type Driver struct {
 	downloadWarmup     singleflight.Group
 	downloadWarmupDone sync.Map
 	cookie             string
-	configCookieHash   string
-	rootPath           string
-	rootID             string
-	limiter            *drive.BandwidthLimiter
-	stateStore         drive.StateStore
+	// configCookie is the credential from the mount config. It never changes
+	// at runtime and seeds the persisted rotation state: state is only reused
+	// while this value stays the same.
+	configCookie     string
+	configCookieHash string
+	rootPath         string
+	rootID           string
+	limiter          *drive.BandwidthLimiter
+	stateStore       drive.StateStore
+	// cred owns the shared-session lifecycle for mounts that reference a
+	// [[credentials]] entry; nil keeps the per-mount state store behaviour.
+	cred               *driverutil.CredentialBinding[credentialPayload]
 	cookieSource       string
 	cookieUpdated      time.Time
 	debugMu            sync.Mutex
@@ -163,6 +203,17 @@ type Driver struct {
 	offlineMu       sync.Mutex
 	offlineSessions map[string]string
 	offlineLayouts  map[string]drive.OfflineLayout
+
+	// sharePollTimeout bounds synchronous share-link tasks. Tests shorten it
+	// to exercise the timeout branch without waiting the production window.
+	sharePollTimeout  time.Duration
+	sharePollInterval time.Duration
+
+	// shareSaveMu guards shareSaves: the selected entries of an asynchronous
+	// provider save, keyed by task id. The task response reports only successful
+	// FIDs, so without the request entries a partial save would look complete.
+	shareSaveMu sync.Mutex
+	shareSaves  map[string][]drive.ShareEntry
 }
 
 type Options struct {
@@ -176,9 +227,18 @@ type Options struct {
 }
 
 type cookieState struct {
-	Cookie           string    `json:"cookie,omitempty"`
-	UpdatedAt        time.Time `json:"updated_at,omitempty"`
-	ConfigCookieHash string    `json:"config_cookie_hash,omitempty"`
+	Cookie string `json:"cookie,omitempty"`
+	// Seed fingerprints the config cookie this state was derived from. A
+	// rotated session is only reused while the configured credential is
+	// unchanged; replacing the cookie (switching accounts, for example) must
+	// not stay masked by a session persisted for the previous credential.
+	Seed             string `json:"seed,omitempty"`
+	ConfigCookieHash string `json:"config_cookie_hash,omitempty"`
+	// Account is the provider account identity (__uid) carried by Cookie. It
+	// lets state files written before Seed existed be checked as well and
+	// makes the owning account visible in the state file.
+	Account   string    `json:"account,omitempty"`
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
 }
 
 const quarkSessionFile = "quark_upload_sessions.json"
@@ -208,23 +268,33 @@ func (d *Driver) DebugSnapshot(ctx context.Context) (drive.DebugSnapshot, error)
 	if d.getLastError() != "" {
 		health = "degraded"
 	}
+	rotations, lastReason := d.cl.downloadDebugSnapshot()
 	return drive.DebugSnapshot{
 		Driver:      "quark",
 		Health:      health,
 		GeneratedAt: time.Now(),
 		Stats: map[string]any{
-			"active_uploads":        len(activeUploads),
-			"url_cache_count":       urlCacheCount,
-			drive.DebugStatRootID:   d.rootID,
-			drive.DebugStatRootPath: d.rootPath,
+			"active_uploads":              len(activeUploads),
+			"url_cache_count":             urlCacheCount,
+			"download_rotations":          rotations,
+			"last_download_rotate_reason": lastReason,
+			"penalized_edges":             d.cl.edges.debugSnapshot(time.Now()),
+			drive.DebugStatRootID:         d.rootID,
+			drive.DebugStatRootPath:       d.rootPath,
 		},
-		Extra: map[string]any{
-			drive.DebugExtraCredentialSource:   d.cookieSource,
-			drive.DebugExtraCredentialUpdated:  d.cookieUpdated,
-			drive.DebugExtraLastError:          d.getLastError(),
-			drive.DebugExtraInstantUploadCount: d.instantUploadCount,
-		},
+		Extra: d.credentialDebugExtra(),
 	}, nil
+}
+
+func (d *Driver) credentialDebugExtra() map[string]any {
+	extra := map[string]any{
+		drive.DebugExtraCredentialSource:   d.cookieSource,
+		drive.DebugExtraCredentialUpdated:  d.cookieUpdated,
+		drive.DebugExtraLastError:          d.getLastError(),
+		drive.DebugExtraInstantUploadCount: d.instantUploadCount,
+	}
+	d.cred.Debug(extra)
+	return extra
 }
 
 func (d *Driver) metricEvents(ctx context.Context, since time.Time) ([]drive.MetricEvent, error) {
@@ -268,18 +338,42 @@ func (d *Driver) loadCookieState() {
 		return
 	}
 	var state cookieState
-	err := d.stateStore.LoadJSON("quark_cookie.json", &state)
-	if err != nil {
+	if err := d.stateStore.LoadJSON("quark_cookie.json", &state); err != nil {
 		return
 	}
-	// A rotated cookie is usable only for the configured login that produced
-	// it. Reconnecting another account must not silently restore the old one.
-	if state.Cookie != "" && state.ConfigCookieHash == d.configCookieHash {
-		d.cookie = state.Cookie
-		d.cl.setCookie(state.Cookie)
-		d.cookieSource = "state"
-		d.cookieUpdated = state.UpdatedAt
+	d.cookieUpdated = state.UpdatedAt
+	if state.Cookie == "" || !d.adoptableCookieState(state) {
+		return
 	}
+	d.cookie = state.Cookie
+	d.cl.setCookie(state.Cookie)
+	d.cookieSource = "state"
+}
+
+// adoptableCookieState reports whether persisted rotation state may replace the
+// configured cookie. Rotated sessions have to survive restarts for the same
+// credential, but a credential the user replaced — a different account in
+// particular — always wins over a session persisted earlier.
+func (d *Driver) adoptableCookieState(state cookieState) bool {
+	if state.ConfigCookieHash != "" && state.Seed == "" {
+		return state.ConfigCookieHash == d.configCookieHash
+	}
+	if d.configCookie == "" {
+		// No configured credential to protect: the persisted session is the
+		// only credential available.
+		return true
+	}
+	if state.Seed != "" {
+		return state.Seed == cookieFingerprint(d.configCookie)
+	}
+	// State written before Seed existed: compare the account identity when
+	// both sides expose one. An unbound session must not mask a new login.
+	configAccount := cookieAccount(d.configCookie)
+	stateAccount := cookieAccount(state.Cookie)
+	if configAccount == "" || stateAccount == "" {
+		return false
+	}
+	return configAccount == stateAccount
 }
 
 // validateWithFallback runs validate with the current cookie and, when the
@@ -303,26 +397,151 @@ func (d *Driver) validateWithFallback(ctx context.Context, configCookie string, 
 	if retryErr := validate(); retryErr != nil {
 		return retryErr
 	}
-	// The config cookie authenticated; persist it so later restarts do not
-	// reuse the stale state cookie again.
-	d.saveUpdatedCookie(d.cookie)
+	// The config cookie authenticated; record it so later restarts and sibling
+	// mounts do not reuse the stale session again.
+	d.rememberCookie(d.cookie, "config")
 	return nil
 }
 
+// rememberCookie persists the active cookie either in the shared credential
+// session or, for legacy inline mounts, in the per-mount state file.
+func (d *Driver) rememberCookie(cookie, source string) {
+	if d.cred.Session() != nil {
+		d.commitCredentialCookie(cookie)
+		return
+	}
+	d.persistCookieState(cookie, source)
+}
+
+// loadCredentialSession adopts the shared session's cookie when it belongs to
+// the configured account.
+func (d *Driver) loadCredentialSession() {
+	d.cred.Load()
+}
+
+// subscribeCredentialSession follows rotations committed by sibling mounts.
+func (d *Driver) subscribeCredentialSession() {
+	d.cred.Subscribe()
+}
+
+// applyCredentialBinding applies one decoded payload to the client.
+func (d *Driver) applyCredentialBinding(value credentialPayload, snapshot drive.CredentialSnapshot, source string) bool {
+	if value.Cookie == "" {
+		return false
+	}
+	if config := cookieAccount(d.configCookie); config != "" {
+		if account := cookieAccount(value.Cookie); account != "" && account != config {
+			return false
+		}
+	}
+	d.cookie = value.Cookie
+	d.cl.setCookie(value.Cookie)
+	d.cookieSource = source
+	d.cookieUpdated = snapshot.UpdatedAt
+	return true
+}
+
+// recoverCredential adopts a session a sibling mount rotated after this mount's
+// last request failed with 401.
+func (d *Driver) recoverCredential() bool {
+	if d.cred.Recover() {
+		return true
+	}
+	// Final fallback: the configured cookie is authoritative when no sibling
+	// session can recover the request.
+	if d.configCookie != "" && d.configCookie != d.cl.cookieValue() {
+		d.cl.setCookie(d.configCookie)
+		d.cookie = d.configCookie
+		d.cookieSource = "config"
+		return true
+	}
+	return false
+}
+
+func (d *Driver) commitCredentialCookie(cookie string) {
+	if d.cred.Session() == nil || cookie == "" {
+		return
+	}
+	if err := d.cred.Commit(encodeCredentialCookie(cookie), cookieAccount(cookie)); err != nil && !errors.Is(err, drive.ErrCredentialVersionConflict) {
+		logging.L.Warnf("[QUARK] commit shared credential failed: %v", err)
+	}
+}
+
+type credentialPayload struct {
+	Cookie string `json:"cookie"`
+}
+
+func encodeCredentialCookie(cookie string) []byte {
+	data, err := json.Marshal(credentialPayload{Cookie: cookie})
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+func decodeCredentialPayload(payload []byte) (credentialPayload, error) {
+	var decoded credentialPayload
+	if len(payload) == 0 {
+		return decoded, nil
+	}
+	err := json.Unmarshal(payload, &decoded)
+	return decoded, err
+}
+
+// cookieFingerprint returns a stable digest of a cookie header. Pairs are
+// sorted so a re-exported cookie whose keys were reordered still matches.
+func cookieFingerprint(cookie string) string {
+	pairs := make([]string, 0, 16)
+	for pair := range strings.SplitSeq(cookie, ";") {
+		if pair = strings.TrimSpace(pair); pair != "" {
+			pairs = append(pairs, pair)
+		}
+	}
+	if len(pairs) == 0 {
+		return ""
+	}
+	slices.Sort(pairs)
+	sum := sha256.Sum256([]byte(strings.Join(pairs, "; ")))
+	return hex.EncodeToString(sum[:])
+}
+
+// cookieAccount returns the provider account identity (__uid) in a cookie.
+func cookieAccount(cookie string) string {
+	for pair := range strings.SplitSeq(cookie, ";") {
+		key, value, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		if ok && strings.TrimSpace(key) == "__uid" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
 func (d *Driver) saveUpdatedCookie(cookie string) {
+	if d.cred.Session() != nil {
+		d.commitCredentialCookie(cookie)
+		return
+	}
+	d.persistCookieState(cookie, "response")
+}
+
+// persistCookieState records the active cookie together with the config cookie
+// it belongs to, so a later restart can tell a rotated session apart from a
+// credential the user replaced.
+func (d *Driver) persistCookieState(cookie, source string) {
 	if cookie == "" {
 		return
 	}
 	d.cookie = cookie
-	d.cookieSource = "response"
+	d.cookieSource = source
 	d.cookieUpdated = time.Now()
 	if d.stateStore == nil {
 		return
 	}
 	if err := d.stateStore.SaveJSON("quark_cookie.json", cookieState{
-		Cookie:           cookie,
-		UpdatedAt:        d.cookieUpdated,
-		ConfigCookieHash: d.configCookieHash,
+		Cookie:    cookie,
+		Seed:      cookieFingerprint(d.configCookie),
+		Account:   cookieAccount(cookie),
+		UpdatedAt: d.cookieUpdated,
 	}); err != nil {
 		logging.L.Warnf("[QUARK] save updated cookie state failed: %v", err)
 	}

@@ -31,10 +31,10 @@ var packagePolicy = map[string]map[string]bool{
 	"buildinfo":    {},
 	"config":       allow("crypt", "drive", "util"),
 	"contracttest": allow("drive", "vfs"),
-	"control":      allow("buildinfo", "contracttest", "drive", "logging", "task", "util", "vfs"),
-	"core":         allow("config", "control", "crypt", "drive", "limits", "logging", "media", "task", "util", "vfs"),
+	"control":      allow("buildinfo", "contracttest", "drive", "logging", "share", "task", "util", "vfs"),
+	"core":         allow("config", "control", "crypt", "drive", "limits", "logging", "media", "share", "task", "util", "vfs"),
 	"crypt":        allow("drive"),
-	"drive":        allow("util"),
+	"drive":        allow("readbudget", "util"),
 	"drivers":      allow("drive", "logging", "util"),
 	"install":      allow("util"),
 	"limits":       {},
@@ -42,11 +42,13 @@ var packagePolicy = map[string]map[string]bool{
 	"media":        allow("limits"),
 	"mobile":       allow("core", "drive", "drivers", "logging"),
 	"mount":        allow("drive", "logging", "vfs"),
+	"readbudget":   {},
 	"selfupdate":   {},
+	"share":        allow("drive", "task"),
 	"syncer":       allow("drive", "util", "vfs"),
 	"task":         allow("util"),
 	"util":         {},
-	"vfs":          allow("drive", "logging", "task", "util"),
+	"vfs":          allow("drive", "logging", "readbudget", "task", "util"),
 }
 
 func allow(names ...string) map[string]bool {

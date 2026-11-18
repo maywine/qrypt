@@ -120,15 +120,28 @@ func (l *WebLogin) Poll(ctx context.Context) (drive.WebLoginResult, error) {
 }
 
 func (l *WebLogin) exchange(ctx context.Context, ticket string) (string, error) {
+	// The account API uses a string code, unlike the drive API's numeric code.
+	var account struct {
+		Success bool   `json:"success"`
+		Code    string `json:"code"`
+	}
+	if err := l.get(ctx, l.accountURL, url.Values{"st": {ticket}, "lw": {"scan"}}, &account); err != nil {
+		return "", err
+	}
+	if !account.Success || account.Code != "OK" {
+		return "", fmt.Errorf("%w: quark web account rejected", drive.ErrAuth)
+	}
 	for _, step := range []struct {
 		url    string
 		params url.Values
 	}{
-		{l.accountURL, url.Values{"st": {ticket}, "lw": {"scan"}}},
 		{l.configURL, url.Values{"pr": {"ucpro"}, "fr": {"pc"}}},
 		{l.driveURL + "/file/sort", url.Values{"pr": {"ucpro"}, "fr": {"pc"}, "pdir_fid": {"0"}, "_size": {"1"}}},
 	} {
-		var reply webLoginReply
+		var reply struct {
+			Status int `json:"status"`
+			Code   int `json:"code"`
+		}
 		if err := l.get(ctx, step.url, step.params, &reply); err != nil {
 			return "", err
 		}
@@ -178,7 +191,7 @@ func loginParams() url.Values {
 	}
 }
 
-func (l *WebLogin) get(ctx context.Context, endpoint string, params url.Values, reply *webLoginReply) error {
+func (l *WebLogin) get(ctx context.Context, endpoint string, params url.Values, reply any) error {
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return fmt.Errorf("quark: invalid web login endpoint")

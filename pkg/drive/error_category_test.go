@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"testing"
+	"time"
 )
 
 type timeoutError struct{}
@@ -27,6 +28,8 @@ func TestErrorCategory(t *testing.T) {
 		{name: "cancelled", err: context.Canceled, want: ErrorCategoryCancelled},
 		{name: "deadline", err: context.DeadlineExceeded, want: ErrorCategoryTimeout},
 		{name: "net timeout", err: timeoutError{}, want: ErrorCategoryTimeout},
+		{name: "fetch timeout", err: &FetchTimeoutError{Kind: FetchTimeoutIdle, Limit: time.Second}, want: ErrorCategoryTimeout},
+		{name: "wrapped fetch timeout", err: fmt.Errorf("vfs: read: %w", &FetchTimeoutError{Kind: FetchTimeoutTotal, Limit: time.Minute}), want: ErrorCategoryTimeout},
 		{name: "space unsupported", err: ErrSpaceUnsupported, want: ErrorCategoryUnsupported},
 		{name: "not found", err: fmt.Errorf("wrapped: %w", fs.ErrNotExist), want: ErrorCategoryNotFound},
 		{name: "auth sentinel", err: fmt.Errorf("quark list: %w", ErrAuth), want: ErrorCategoryAuth},
@@ -34,6 +37,8 @@ func TestErrorCategory(t *testing.T) {
 		{name: "invalid input sentinel", err: fmt.Errorf("%w: bad payload", ErrInvalidInput), want: ErrorCategoryInvalidRequest},
 		{name: "exists", err: fmt.Errorf("wrapped: %w", fs.ErrExist), want: ErrorCategoryConflict},
 		{name: "permission sentinel", err: os.ErrPermission, want: ErrorCategoryPermission},
+		{name: "drive permission sentinel", err: fmt.Errorf("quark: %w", ErrPermission), want: ErrorCategoryPermission},
+		{name: "drive conflict sentinel", err: fmt.Errorf("quark: %w", ErrConflict), want: ErrorCategoryConflict},
 		{name: "path permission", err: &fs.PathError{Op: "open", Path: "/tmp/secret", Err: os.ErrPermission}, want: ErrorCategoryPermission},
 		{name: "auth text", err: fmt.Errorf("quark list: HTTP 401 unauthorized"), want: ErrorCategoryAuth},
 		{name: "rate limit text", err: fmt.Errorf("upload: too many requests 429"), want: ErrorCategoryRateLimit},
@@ -46,6 +51,12 @@ func TestErrorCategory(t *testing.T) {
 				t.Fatalf("ErrorCategory(%v) = %q, want %q", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRetryableCategoryTreatsFetchTimeoutAsTransient(t *testing.T) {
+	if !RetryableCategory(ErrorCategory(&FetchTimeoutError{Kind: FetchTimeoutIdle})) {
+		t.Fatal("fetch timeout must be retryable")
 	}
 }
 

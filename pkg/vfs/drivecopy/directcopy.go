@@ -118,6 +118,7 @@ type copyResolvedPath struct {
 	Info      diagnostics.DebugResolveInfo
 	Drive     drive.Driver
 	Entry     drive.Entry
+	Source    *drive.ReadSource
 	IsMissing bool
 }
 
@@ -276,7 +277,7 @@ func runDirectDriverCopy(ctx context.Context, source diagnostics.DriverCopySourc
 		}
 	}
 
-	tmp, cleanup, hashes, err := copySourceToTemp(ctx, src.Drive, src.Entry, src.Info.Size, tempDir)
+	tmp, cleanup, hashes, err := copySourceToTemp(ctx, src.Entry, src.Info.Size, tempDir, src.Source)
 	appendCopyStep(result, "read_source_to_temp", tmp.bytes, tmp.started, err)
 	appendCopyEvent(result, "read_source_to_temp", src.Mount, src.Driver, result.SourcePath, tmp.bytes, tmp.started, nil)
 	defer cleanup()
@@ -482,10 +483,13 @@ type tempCopy struct {
 	started time.Time
 }
 
-func copySourceToTemp(ctx context.Context, srcDriver drive.Driver, srcEntry drive.Entry, expectedSize int64, tempDir string) (tempCopy, func(), drive.SourceHashes, error) {
+func copySourceToTemp(ctx context.Context, srcEntry drive.Entry, expectedSize int64, tempDir string, source *drive.ReadSource) (tempCopy, func(), drive.SourceHashes, error) {
 	start := util.Now()
 	cleanup := func() {}
-	rc, err := srcDriver.Read(ctx, srcEntry, 0, 0)
+	if source == nil {
+		return tempCopy{}, func() {}, nil, fmt.Errorf("copy: mounted read source unavailable")
+	}
+	rc, err := source.Read(ctx, srcEntry, 0, 0)
 	if err != nil {
 		return tempCopy{started: start}, cleanup, nil, err
 	}
@@ -539,9 +543,13 @@ func resolveCopyPath(ctx context.Context, source diagnostics.DriverCopySource, d
 	if driver == nil {
 		return copyResolvedPath{}, fmt.Errorf("mount %q not found", mountName)
 	}
+	var readSource *drive.ReadSource
+	if provider, ok := source.(drive.ReadSourceProvider); ok {
+		readSource = provider.ReadSourceForPath(virtualPath)
+	}
 	missing := info.RemoteID == ""
 	if missing {
-		return copyResolvedPath{Path: virtualPath, Mount: mountName, Driver: info.Driver, Info: info, Drive: driver, IsMissing: true}, nil
+		return copyResolvedPath{Path: virtualPath, Mount: mountName, Driver: info.Driver, Info: info, Drive: driver, Source: readSource, IsMissing: true}, nil
 	}
 	if info.Driver == "" {
 		if snap, err := driver.DebugSnapshot(ctx); err == nil {
@@ -554,6 +562,7 @@ func resolveCopyPath(ctx context.Context, source diagnostics.DriverCopySource, d
 		Driver: info.Driver,
 		Info:   info,
 		Drive:  driver,
+		Source: readSource,
 		Entry: drive.Entry{
 			ID:       info.RemoteID,
 			ParentID: info.ParentID,

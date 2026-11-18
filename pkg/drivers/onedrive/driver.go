@@ -67,6 +67,7 @@ type Driver struct {
 	appMode      bool
 	tenantID     string
 	email        string
+	account      string
 	customHost   string
 
 	useOnlineAPI bool
@@ -78,6 +79,11 @@ type Driver struct {
 	mu           sync.RWMutex
 	accessToken  string
 	refreshToken string
+
+	// cred owns the shared-session lifecycle for mounts that reference a
+	// [[credentials]] entry; a nil session keeps per-mount tokens.
+	cred        *driverutil.CredentialBinding[credentialPayload]
+	tokenSource string
 
 	chunkSize        int64
 	disableDiskUsage bool
@@ -227,7 +233,7 @@ func New(opts Options) *Driver {
 	if client == nil {
 		client = httputil.NewClient(0, 60*time.Second)
 	}
-	return &Driver{
+	d := &Driver{
 		region:           region,
 		apiBaseURL:       apiBaseURL,
 		oauthBaseURL:     oauthBaseURL,
@@ -250,9 +256,15 @@ func New(opts Options) *Driver {
 		client:           client,
 		metrics:          driverutil.NewBuffer(500),
 	}
+	d.cred = driverutil.NewCredentialBinding("onedrive", decodeCredentialPayload, d.applyCredentialBinding)
+	return d
 }
 
 func (d *Driver) Init(ctx context.Context) error {
+	if d.cred.Session() != nil {
+		d.loadCredentialSession()
+		d.subscribeCredentialSession()
+	}
 	if d.isSharepoint && d.siteID == "" {
 		return fmt.Errorf("onedrive: site_id is required when is_sharepoint=true")
 	}
@@ -269,6 +281,7 @@ func (d *Driver) Init(ctx context.Context) error {
 			return err
 		}
 	}
+	d.loadAccount(ctx)
 	root, err := d.itemByPath(ctx, d.rootPath)
 	if err != nil {
 		return fmt.Errorf("%s: resolve root_path %q: %w", d.driverName(), d.rootPath, err)
@@ -281,6 +294,7 @@ func (d *Driver) Init(ctx context.Context) error {
 }
 
 func (d *Driver) Drop(ctx context.Context) error {
+	d.cred.Close()
 	d.sessionStoreMu.Lock()
 	if d.sessionCancel != nil {
 		d.sessionCancel()
@@ -295,6 +309,12 @@ func (d *Driver) Drop(ctx context.Context) error {
 
 // InstallStateStore 接入绑定索引并启动过期回收：本地只保存
 // "内容键 → uploadUrl"，进度在恢复时用 nextExpectedRanges 查询。
+// InstallCredentialSession lets every mount of one configured OneDrive
+// credential share one token pair and coalesce refreshes.
+func (d *Driver) InstallCredentialSession(session drive.CredentialSession) {
+	d.cred.Install(session)
+}
+
 func (d *Driver) InstallStateStore(store drive.StateStore) {
 	d.sessionStoreMu.Lock()
 	defer d.sessionStoreMu.Unlock()
@@ -343,14 +363,18 @@ func (d *Driver) DebugSnapshot(ctx context.Context) (drive.DebugSnapshot, error)
 			"email":                 d.email,
 			"chunk_size":            d.chunkSize,
 		},
-		Extra: map[string]any{
-			drive.DebugExtraCredentialSource: credentialSource(d.useOnlineAPI),
-		},
+		Extra: d.debugExtra(),
 	}, nil
 }
 
 func (d *Driver) Metrics(ctx context.Context, since time.Time) ([]drive.MetricEvent, error) {
 	return drive.NormalizeMetricEvents(d.driverName(), d.metrics.Events(since)), nil
+}
+
+// UploadProfile exposes the chunk size a probe may sweep. Parts are uploaded
+// sequentially, so it does not accept a concurrency override.
+func (d *Driver) UploadProfile() drive.UploadProfile {
+	return drive.UploadProfile{ChunkSize: d.chunkSize}
 }
 
 func (d *Driver) Capabilities() []drive.Capability {
@@ -369,6 +393,15 @@ func (d *Driver) Capabilities() []drive.Capability {
 
 func (d *Driver) RemoteHash(_ context.Context, entry drive.Entry) (drive.HashAlgorithm, string, error) {
 	return drive.RemoteHashFromExtra(entry, "sha1", drive.HashSHA1)
+}
+
+// RemoteHashInfo reports the provider-computed SHA1 from the Graph listing.
+func (d *Driver) RemoteHashInfo(ctx context.Context, entry drive.Entry) (drive.RemoteHashInfo, error) {
+	algorithm, hash, err := d.RemoteHash(ctx, entry)
+	if err != nil {
+		return drive.RemoteHashInfo{}, err
+	}
+	return drive.RemoteHashInfo{Algorithm: algorithm, Hash: hash, Verified: true, Source: drive.RemoteHashSourceProvider}, nil
 }
 
 func (d *Driver) ResolvePath(ctx context.Context, p string) (string, error) {

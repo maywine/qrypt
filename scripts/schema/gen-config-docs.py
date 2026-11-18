@@ -32,7 +32,7 @@ def display_default(prop):
     return prop.get("x-doc-default", fmt_default(prop.get("default")))
 
 
-def build_field_rows(props, skip_encryption=False, skip_cache=False):
+def build_field_rows(props, skip_encryption=False, skip_cache=False, skip_type=True):
     rows = []
     rows.append("| 参数 | 类型 | 默认值 | 说明 |")
     rows.append("|---|---|---|---|")
@@ -41,7 +41,7 @@ def build_field_rows(props, skip_encryption=False, skip_cache=False):
             continue
         if skip_cache and name in ("read_cache", "upload"):
             continue
-        if name == "type":
+        if skip_type and name == "type":
             continue
         t = prop.get("type", "string")
         default_val = display_default(prop)
@@ -110,16 +110,30 @@ def generate():
     sections.append("")
     common_mount_props = {
         name: mount_props[name]
-        for name in ("name", "type", "test_enabled")
+        for name in ("name", "type", "credential", "test_enabled")
         if name in mount_props
     }
     sections.append("通用参数：")
     sections.append("")
     sections.append(build_field_rows(common_mount_props))
     sections.append("")
+
+    credential_props, credential_desc = section(defs, "credentialConfig")
+    sections.append("## 共享凭据")
+    sections.append("")
+    sections.append(credential_desc)
+    sections.append("")
+    sections.append(build_field_rows(credential_props, skip_type=False))
+    sections.append("")
     sections.append(
-        "每个 mount 可以在 `[mounts.encryption]`、`[mounts.read_cache]` "
-        "和 `[mounts.upload]` 中覆盖全局配置，具体参数见对应章节。"
+        "凭据级参数（见[支持的驱动](support-drivers.md)中的“作用域”列）写在 "
+        "`[credentials.params]`，路径级参数写在 `[mounts.params]`；"
+        "同一凭据可以被任意多个挂载引用。"
+    )
+    sections.append("")
+    sections.append(
+        "每个 mount 可以在 `[mounts.encryption]`、`[mounts.read_cache]`、"
+        "`[mounts.read]` 和 `[mounts.upload]` 中覆盖全局配置，具体参数见对应章节。"
     )
     sections.append("")
 
@@ -152,6 +166,23 @@ def generate():
     sections.append(read_cache_desc)
     sections.append("")
     sections.append(build_field_rows(read_cache_props))
+    sections.append("")
+
+    read_profile_props, read_profile_desc = section(defs, "readConfig")
+    sections.append("## 读取策略（`[mounts.read]`）")
+    sections.append("")
+    sections.append(read_profile_desc)
+    sections.append("")
+    sections.append(build_field_rows(read_profile_props))
+    sections.append("")
+    bulk_props, bulk_desc = section(defs, "bulkReadConfig")
+    sections.append("### 批量读取（`[mounts.read.bulk]`）")
+    sections.append("")
+    sections.append(bulk_desc)
+    sections.append("")
+    sections.append(build_field_rows(bulk_props))
+    sections.append("")
+    sections.append("建议先用 `qrypt probe test read` 对比单流和多流，确认收益后再覆盖驱动建议。驱动能力见[支持的驱动](support-drivers.md)。旧配置迁移见[读取配置迁移](read-policy-migration.md)。")
     sections.append("")
 
     thumbnail_props, thumbnail_desc = section(defs, "thumbnailCacheConfig")

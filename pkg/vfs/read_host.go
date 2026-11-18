@@ -27,13 +27,12 @@ type readState = read.State
 // vfsReadHost adapts VFS internals to read.Host.
 type vfsReadHost struct {
 	resolver pathResolver
-	driver   drive.Driver
 	store    *upload.Domain
 	rootID   string
 }
 
 func newVFSReadHost(v *VFS) vfsReadHost {
-	return vfsReadHost{resolver: v, driver: v.driver, store: v.uploads, rootID: v.rootID}
+	return vfsReadHost{resolver: v, store: v.uploads, rootID: v.rootID}
 }
 
 func (h vfsReadHost) Resolve(ctx context.Context, path string) (drive.Entry, error) {
@@ -50,10 +49,6 @@ func (h vfsReadHost) PendingUpload(path string) (vfstypes.PendingUpload, bool, e
 
 func (h vfsReadHost) ReadCacheKey(entry drive.Entry) string {
 	return read.CacheKey(h.rootID, entry)
-}
-
-func (h vfsReadHost) DriverRead(ctx context.Context, entry drive.Entry, offset, size int64) (io.ReadCloser, error) {
-	return h.driver.Read(ctx, entry, offset, size)
 }
 
 // vfsReadHost adapts only the read host surface; debug instrumentation
@@ -122,6 +117,34 @@ func (v *VFS) Read(ctx context.Context, path string, offset, size int64) (io.Rea
 	return v.reader.Read(ctx, path, offset, size)
 }
 
+// SetReadPlanOverride applies a measurement-only stream/window/timeout
+// override to every read until ClearReadPlanOverride. Probe read benchmarks
+// use it to compare configurations without rebuilding or remounting. It is not
+// exposed through the CLI or config.
+func (v *VFS) SetReadPlanOverride(mount string, maxStreams int, windowBytes int64, idle, total time.Duration) error {
+	if mount != "" && vfstypes.CleanMountName(mount) != vfstypes.CleanMountName(v.name) {
+		return fmt.Errorf("vfs: unknown mount %q", mount)
+	}
+	if maxStreams < 0 || maxStreams > 32 || windowBytes < 0 || windowBytes > drive.MaxReadWindowBytes {
+		return fmt.Errorf("vfs: invalid read measurement override")
+	}
+	if maxStreams > 1 && !v.readSource.Policy().Limits.Parallel {
+		return fmt.Errorf("vfs: driver does not support shared parallel ranges")
+	}
+	v.reader.SetPlanOverride(read.PlanOverride{
+		MaxStreams:        maxStreams,
+		WindowChunks:      int((windowBytes + read.ChunkSize - 1) / read.ChunkSize),
+		FetchIdleTimeout:  idle,
+		FetchTotalTimeout: total,
+	})
+	return nil
+}
+
+// ClearReadPlanOverride removes the measurement override.
+func (v *VFS) ClearReadPlanOverride() {
+	v.reader.ClearPlanOverride()
+}
+
 // ReleaseReadSession forgets adaptive read hints for a closed open-file
 // handle. It leaves completed and in-flight cache fills intact.
 func (v *VFS) ReleaseReadSession(sessionID uint64) {
@@ -157,6 +180,24 @@ func (v *VFS) ReadStream(ctx context.Context, path string) (io.ReadCloser, error
 	return v.reader.ReadStream(ctx, path)
 }
 
+// CancelReadPrefetch stops speculative prefetch for path without dropping
+// completed cache fills. Mobile uses it when a handle closes or the user
+// cancels a read.
+func (v *VFS) CancelReadPrefetch(ctx context.Context, path string) error {
+	entry, err := v.resolve(ctx, path)
+	if err != nil {
+		return err
+	}
+	if entry.ID == "" {
+		return nil
+	}
+	if cacheKey := v.readCacheKey(entry); cacheKey != "" {
+		v.read.CancelPrefetchForFile(cacheKey)
+	}
+	v.read.CancelPrefetchForFile(entry.ID)
+	return nil
+}
+
 // readCacheKey computes the stable cache key for an entry.
 func (v *VFS) readCacheKey(entry drive.Entry) string {
 	return read.CacheKey(v.rootID, entry)
@@ -173,6 +214,17 @@ func (v *VFS) debugHotChunks() (int, int64) {
 // internal/read).
 var WithoutReadPrefetch = read.WithoutReadPrefetch
 var WithoutDirPrefetch = listing.WithoutDirPrefetch
+
+type ReadIntent = read.ReadIntent
+
+const (
+	ReadIntentUnspecified = read.ReadIntentUnspecified
+	ReadIntentInteractive = read.ReadIntentInteractive
+	ReadIntentBulk        = read.ReadIntentBulk
+	ReadIntentProbe       = read.ReadIntentProbe
+)
+
+var WithReadIntent = read.WithReadIntent
 
 type ReadPriority = read.Priority
 

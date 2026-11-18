@@ -3,8 +3,10 @@ package read
 import (
 	"context"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/yinzhenyu/qrypt/pkg/drive"
 	"github.com/yinzhenyu/qrypt/pkg/vfs/readcache"
@@ -12,8 +14,9 @@ import (
 
 // Read-domain constants.
 const (
-	// ChunkSize 是 VFS 读取、缓存和预取使用的基础文件块大小。
-	ChunkSize = 512 * 1024
+	// ChunkSize 是 VFS 读取、缓存和预取使用的基础文件块大小，与读配置中的
+	// 块单位一致。
+	ChunkSize = drive.ReadChunkSize
 	// PrefetchChunks 是普通读取首次或非连续读取使用的预取块数量。
 	PrefetchChunks = 8
 	// MaxConcurrency 是 VFS 读取任务允许占用的并发槽位总数。
@@ -46,30 +49,82 @@ const (
 	// 环形缓冲从 64 起按需倍增，从未发生过读取的挂载不预付这份内存。
 )
 
+type windowChunk struct {
+	ready chan struct{}
+	data  []byte // Immutable after ready closes.
+}
+
 // windowLoad coalesces concurrent reads of the same cache window.
-// mu guards loads; entries are removed when their window load finishes.
+// The registry lock guards ownership; block readiness guards published bytes.
 type windowLoad struct {
-	fid   string
-	start int64
-	end   int64
-	done  chan struct{}
-	data  map[int64][]byte
-	extra map[string]any
-	err   error
+	fid string
+	// key is the coalescing key this load was registered under. It lets a load
+	// unregister only itself, so a late speculative cleanup cannot remove a
+	// foreground load that took the window over.
+	key     string
+	start   int64
+	end     int64
+	streams int
+	// prefetch marks a speculative load. A timed-out prefetch is a silent
+	// cancellation for foreground readers, not a read failure.
+	prefetch  bool
+	trace     *drive.ReadTrace
+	createdAt time.Time
+	sessionID uint64
+	waiters   int
+	abandoned bool
+	// cancel stops this load. It is set for speculative loads so a foreground
+	// reader that gives up waiting can also stop the work it is duplicating.
+	cancel      context.CancelFunc
+	chunks      []windowChunk
+	progressive bool // Known-size loads can publish before the window finishes.
+	done        chan struct{}
+	data        map[int64][]byte
+	extra       map[string]any
+	err         error
 }
 
-// slotState bounds concurrent driver reads. The normal/high channels are
-// the lock itself - no additional mutex. Lifecycle: created in NewState,
-// never closed (workers select on the VFS context instead).
-type slotState struct {
-	normal chan struct{}
-	high   chan struct{}
+// readyFor also wakes on terminal failure, which closes every missing block.
+func (w *windowLoad) readyFor(index int64) <-chan struct{} {
+	if len(w.chunks) != 0 {
+		return w.chunks[index-w.start].ready
+	}
+	return w.done
 }
 
-func newSlotState() *slotState {
-	return &slotState{
-		normal: make(chan struct{}, MaxConcurrency-HighReserve),
-		high:   make(chan struct{}, HighReserve),
+func (w *windowLoad) result(index int64) ([]byte, error) {
+	if len(w.chunks) != 0 {
+		if data := w.chunks[index-w.start].data; data != nil {
+			return data, nil
+		}
+	}
+	// No block was published: readyFor only closes after err has been set.
+	return w.data[index], w.err
+}
+
+func (w *windowLoad) publish(index int64, data []byte) {
+	chunk := &w.chunks[index-w.start]
+	chunk.data = data
+	close(chunk.ready)
+}
+
+func (w *windowLoad) finishChunks() {
+	for i := range w.chunks {
+		if w.chunks[i].data == nil {
+			close(w.chunks[i].ready)
+		}
+	}
+}
+
+func (w *windowLoad) chunkAvailable(index int64) bool {
+	if len(w.chunks) == 0 {
+		return false
+	}
+	select {
+	case <-w.chunks[index-w.start].ready:
+		return w.chunks[index-w.start].data != nil
+	default:
+		return false
 	}
 }
 
@@ -116,15 +171,6 @@ func newFastPathState() *fastPathState {
 	}
 }
 
-// prefetchState tracks in-flight window prefetches.
-type prefetchState struct {
-	mu              sync.Mutex
-	inFlight        map[string]struct{}
-	cancels         map[string]map[string]context.CancelFunc
-	sem             chan struct{}
-	foregroundReads atomic.Int32
-}
-
 type sequentialRead struct {
 	end       int64
 	lastChunk int64
@@ -142,9 +188,12 @@ type sequentialKey struct {
 }
 
 type accessDecision struct {
-	sequential    bool
-	stale         bool
-	adaptive      bool
+	sequential bool
+	stale      bool
+	adaptive   bool
+	// initial marks the first access of a session, which is a fresh stream
+	// rather than a seek away from established lookahead.
+	initial       bool
 	discontinuous bool
 	run           uint64
 }
@@ -164,14 +213,6 @@ type sequentialState struct {
 
 func newSequentialState() *sequentialState {
 	return &sequentialState{reads: map[sequentialKey]sequentialRead{}}
-}
-
-func newPrefetchState() *prefetchState {
-	return &prefetchState{
-		inFlight: map[string]struct{}{},
-		cancels:  map[string]map[string]context.CancelFunc{},
-		sem:      make(chan struct{}, PrefetchLimit),
-	}
 }
 
 // historyEntry pairs a debug event with its append order so the two rings
@@ -305,13 +346,18 @@ func (h *historyState) reset() {
 // are initialized together, touched only by read paths, and shut down by
 // the VFS lifecycle.
 type State struct {
-	cache    Cache
-	history  *historyState
-	prefetch *prefetchState
-	sequence *sequentialState
-	slots    *slotState
-	fastPath *fastPathState
-	windows  *windowState
+	cache      Cache
+	history    *historyState
+	scheduler  *Scheduler
+	sequence   *sequentialState
+	fastPath   *fastPathState
+	windows    *windowState
+	scopes     *ScopeRegistry
+	prefetchMu sync.Mutex // Serializes speculative range selection across sessions.
+	timeouts   timeoutStats
+	// override is a measurement-only plan override (probe test read). It is
+	// nil in normal operation.
+	override atomic.Pointer[PlanOverride]
 }
 
 // NewState builds the read domain state together so ownership and
@@ -319,13 +365,13 @@ type State struct {
 // paths fall back to no caching).
 func NewState(cache Cache) *State {
 	return &State{
-		cache:    cache,
-		history:  newHistoryState(),
-		prefetch: newPrefetchState(),
-		sequence: newSequentialState(),
-		slots:    newSlotState(),
-		fastPath: newFastPathState(),
-		windows:  newWindowState(),
+		cache:     cache,
+		history:   newHistoryState(),
+		scheduler: NewScheduler(DefaultSchedulerConfig()),
+		sequence:  newSequentialState(),
+		fastPath:  newFastPathState(),
+		windows:   newWindowState(),
+		scopes:    newScopeRegistry(),
 	}
 }
 
@@ -333,13 +379,28 @@ func (s *State) observeSequentialRead(cacheKey string, offset, size int64) bool 
 	return s.observeReadAccess(cacheKey, AccessHint{}, offset, size).sequential
 }
 
+func (s *State) setPlanOverride(override PlanOverride) {
+	s.override.Store(&override)
+}
+
+func (s *State) clearPlanOverride() {
+	s.override.Store(nil)
+}
+
+func (s *State) planOverride() (PlanOverride, bool) {
+	if value := s.override.Load(); value != nil {
+		return *value, true
+	}
+	return PlanOverride{}, false
+}
+
 // nextRunFor reports the run id the access at offset belongs to: the previous
 // run while the access continues it, a fresh id when it starts a new pass. It is
 // the single definition of "a new run", shared by the recording path and by the
 // hint the read cache asks for before data is fetched. Callers hold
 // sequence.mu.
-func (s *State) nextRunFor(previous sequentialRead, exists bool, offset int64) uint64 {
-	if exists && offset == previous.end {
+func (s *State) nextRunFor(previous sequentialRead, continues bool) uint64 {
+	if continues {
 		return previous.run
 	}
 	return s.sequence.nextRun + 1
@@ -361,7 +422,7 @@ func (s *State) readRunHint(cacheKey string, offset int64) uint64 {
 	s.sequence.mu.Lock()
 	defer s.sequence.mu.Unlock()
 	previous, exists := s.sequence.reads[sequentialKey{cacheKey: cacheKey}]
-	return s.nextRunFor(previous, exists, offset)
+	return s.nextRunFor(previous, exists && offset == previous.end)
 }
 
 func (s *State) observeReadAccess(cacheKey string, hint AccessHint, offset, size int64) accessDecision {
@@ -385,12 +446,21 @@ func (s *State) observeReadAccess(cacheKey string, hint AccessHint, offset, size
 	if adaptive && exists && hint.RequestID <= previous.requestID {
 		return accessDecision{stale: true, adaptive: true, run: previous.run}
 	}
-	discontinuous := !exists || offset != previous.end
-	confirmed := !hint.Concurrent && exists && previous.confirmed && offset == previous.end
-	if !hint.Concurrent && exists && offset == previous.end && offset/ChunkSize > previous.lastChunk {
+	continues := exists && offset == previous.end
+	// Kernel page alignment can repeat the terminal page of each unaligned
+	// user read. Preserve a known session's forward coverage when the overlap
+	// is bounded and does not move its end backward; canceling here would tear
+	// down useful lookahead at every caller block boundary. Unidentified reads
+	// retain their exact-adjacency rule.
+	if adaptive && exists && offset < previous.end && end >= previous.end && previous.end-offset < ChunkSize {
+		continues = true
+	}
+	discontinuous := !continues
+	confirmed := !hint.Concurrent && exists && previous.confirmed && continues
+	if !hint.Concurrent && continues && offset/ChunkSize > previous.lastChunk {
 		confirmed = true
 	}
-	run := s.nextRunFor(previous, exists, offset)
+	run := s.nextRunFor(previous, continues)
 	if run > s.sequence.nextRun {
 		s.sequence.nextRun = run
 	}
@@ -408,8 +478,11 @@ func (s *State) observeReadAccess(cacheKey string, hint AccessHint, offset, size
 		oldest := s.sequence.order[0]
 		s.sequence.order = s.sequence.order[1:]
 		delete(s.sequence.reads, oldest)
+		if oldest.session != 0 {
+			s.scopes.Cancel(WithAccessHint(context.Background(), AccessHint{SessionID: oldest.session}), oldest.cacheKey, "evicted")
+		}
 	}
-	return accessDecision{sequential: confirmed, adaptive: adaptive, discontinuous: discontinuous, run: run}
+	return accessDecision{sequential: confirmed, adaptive: adaptive, initial: !exists, discontinuous: discontinuous, run: run}
 }
 
 func (s *State) readAccessCurrent(cacheKey string, hint AccessHint) bool {
@@ -430,7 +503,6 @@ func (s *State) ReleaseReadSession(sessionID uint64) {
 		return
 	}
 	s.sequence.mu.Lock()
-	defer s.sequence.mu.Unlock()
 	for key := range s.sequence.reads {
 		if key.session == sessionID {
 			delete(s.sequence.reads, key)
@@ -443,6 +515,8 @@ func (s *State) ReleaseReadSession(sessionID uint64) {
 		}
 	}
 	s.sequence.order = order
+	s.sequence.mu.Unlock()
+	s.cancelScopesBySession(sessionID, "session_release")
 }
 
 // Cache returns the durable chunk store (nil when disabled).
@@ -457,7 +531,11 @@ func (s *State) History() *historyState { return s.history }
 // Safe on a zero State (hand-constructed VFS values in tests may have no
 // cache).
 func (s *State) Close() error {
-	if s == nil || s.cache == nil {
+	if s == nil {
+		return nil
+	}
+	s.cancelAllScopes("close")
+	if s.cache == nil {
 		return nil
 	}
 	return s.cache.Close()
@@ -551,75 +629,77 @@ func (s *State) beginWindowLoad(key string, load *windowLoad) (*windowLoad, bool
 	if existing := s.windows.loads[key]; existing != nil {
 		return existing, true
 	}
+	load.key = key
 	s.windows.loads[key] = load
 	return load, false
 }
 
-func (s *State) endWindowLoad(key string) {
+// endWindowLoad unregisters load. The removal is identity-checked: a
+// speculative load that finished late, or a foreground reader that gave up on
+// one, must not unregister a newer load of the same window.
+func (s *State) endWindowLoad(load *windowLoad) {
+	if load == nil || load.key == "" {
+		return
+	}
 	s.windows.mu.Lock()
-	delete(s.windows.loads, key)
+	if s.windows.loads[load.key] == load {
+		delete(s.windows.loads, load.key)
+	}
 	s.windows.mu.Unlock()
 }
 
-func (s *State) findWindow(cacheKey string, index int64) *windowLoad {
+func (s *State) findWindow(cacheKey string, index int64, streams int, maxChunks int64) *windowLoad {
 	s.windows.mu.Lock()
 	defer s.windows.mu.Unlock()
 	for _, candidate := range s.windows.loads {
-		if candidate.fid == cacheKey && index >= candidate.start && index <= candidate.end {
-			return candidate
+		if candidate.fid != cacheKey || index < candidate.start || index > candidate.end {
+			continue
 		}
+		candidateStreams := candidate.streams
+		if candidateStreams < 1 {
+			candidateStreams = 1
+		}
+		// Speculative windows always use one stream, even when sequential
+		// foreground plans allow more. Their validated bytes are reusable;
+		// hiding them also prevents the foreground's bounded takeover timer
+		// from canceling its own stalled lookahead when the budget is full.
+		if streams > 0 && candidateStreams != streams && !candidate.prefetch {
+			continue
+		}
+		// A window far larger than the caller's own window is not worth
+		// waiting for unless the requested block is already published or is
+		// the head of a progressive load. maxChunks <= 0 accepts any span.
+		if maxChunks > 0 && candidate.end-candidate.start+1 > maxChunks &&
+			(len(candidate.chunks) == 0 || index != candidate.start && !candidate.chunkAvailable(index)) {
+			continue
+		}
+		return candidate
 	}
 	return nil
 }
 
-func (s *State) windowContains(cacheKey string, index int64) bool {
-	return s.findWindow(cacheKey, index) != nil
-}
+func (s *State) reservePrefetch() bool { return s.scheduler.TryAcquirePrefetch() }
 
-func (s *State) reservePrefetch(key string) bool {
-	s.prefetch.mu.Lock()
-	if _, ok := s.prefetch.inFlight[key]; ok {
-		s.prefetch.mu.Unlock()
-		return false
-	}
-	s.prefetch.inFlight[key] = struct{}{}
-	s.prefetch.mu.Unlock()
-
-	select {
-	case s.prefetch.sem <- struct{}{}:
-		return true
-	default:
-		s.prefetch.mu.Lock()
-		delete(s.prefetch.inFlight, key)
-		s.prefetch.mu.Unlock()
-		return false
-	}
-}
-
-func (s *State) releasePrefetch(key string) {
-	<-s.prefetch.sem
-	s.prefetch.mu.Lock()
-	delete(s.prefetch.inFlight, key)
-	s.prefetch.mu.Unlock()
-}
+func (s *State) releasePrefetch() { s.scheduler.ReleasePrefetch() }
 
 func (s *State) beginForegroundRead(cacheKey string) {
 	if cacheKey != "" {
-		s.prefetch.foregroundReads.Add(1)
+		s.scheduler.BeginForeground()
 	}
 }
 
 func (s *State) endForegroundRead(cacheKey string) {
 	if cacheKey != "" {
-		s.prefetch.foregroundReads.Add(-1)
+		s.scheduler.EndForeground()
 	}
 }
 
 // adaptivePrefetchLimit keeps a small lookahead during active foreground
 // reads and allows a wider pipeline when the reader is otherwise idle.
 func (s *State) adaptivePrefetchLimit(sequential bool) int {
-	limit := PrefetchLimit
-	if s.prefetch.foregroundReads.Load() > int32(max(1, (MaxConcurrency-HighReserve)/2)) {
+	stats := s.scheduler.Stats()
+	limit := stats.PrefetchCapacity
+	if s.scheduler.ForegroundCount() > max(1, stats.NormalCapacity/2) {
 		return 1
 	}
 	// Keep the configured pipeline for both initial and confirmed sequential
@@ -629,35 +709,10 @@ func (s *State) adaptivePrefetchLimit(sequential bool) int {
 	return limit
 }
 
-func (s *State) registerPrefetch(cacheKey, key string, cancel context.CancelFunc) {
-	s.prefetch.mu.Lock()
-	defer s.prefetch.mu.Unlock()
-	if s.prefetch.cancels[cacheKey] == nil {
-		s.prefetch.cancels[cacheKey] = map[string]context.CancelFunc{}
-	}
-	s.prefetch.cancels[cacheKey][key] = cancel
-}
-
-func (s *State) unregisterPrefetch(cacheKey, key string) {
-	s.prefetch.mu.Lock()
-	defer s.prefetch.mu.Unlock()
-	if tasks := s.prefetch.cancels[cacheKey]; tasks != nil {
-		delete(tasks, key)
-		if len(tasks) == 0 {
-			delete(s.prefetch.cancels, cacheKey)
-		}
-	}
-}
-
 // cancelPrefetch cancels only speculative reads for one file. Foreground
 // reads use their caller context and are never canceled by a seek elsewhere.
 func (s *State) cancelPrefetch(cacheKey string) {
-	s.prefetch.mu.Lock()
-	tasks := s.prefetch.cancels[cacheKey]
-	for _, cancel := range tasks {
-		cancel()
-	}
-	s.prefetch.mu.Unlock()
+	s.cancelScopesByCacheKey(cacheKey, "seek")
 }
 
 // NextSequence returns the next read-op sequence number.
@@ -691,9 +746,7 @@ func (s *State) RuntimeStats() (windowLoads, prefetches, rangeHits int) {
 	s.windows.mu.Lock()
 	windowLoads = len(s.windows.loads)
 	s.windows.mu.Unlock()
-	s.prefetch.mu.Lock()
-	prefetches = len(s.prefetch.inFlight)
-	s.prefetch.mu.Unlock()
+	prefetches = s.scheduler.Stats().PrefetchInUse
 	s.fastPath.rangeHit.mu.Lock()
 	rangeHits = len(s.fastPath.rangeHit.hits)
 	s.fastPath.rangeHit.mu.Unlock()
@@ -710,6 +763,7 @@ func (s *State) FlushReadCache() error {
 
 // ClearReadCache clears durable and in-memory read-cache entries.
 func (s *State) ClearReadCache() error {
+	s.cancelAllScopes("cache_clear")
 	s.fastPath.hot.mu.Lock()
 	s.fastPath.hot.chunks = map[string][]byte{}
 	s.fastPath.hot.lru = nil
@@ -728,11 +782,82 @@ func (s *State) ClearReadCache() error {
 	return s.cache.ClearReadCache()
 }
 
-// InvalidateFile drops cached chunks for one file id (glossary: 读缓存失效).
+// InvalidateFile drops cached chunks for one file id and cancels in-flight
+// reads for it (glossary: 读缓存失效).
 func (s *State) InvalidateFile(fid string) {
+	s.cancelScopesByCacheKey(fid, "invalidate")
+	s.DropFileCache(fid)
+}
+
+// DropFileCache drops cached chunks and access hints for one file id without
+// cancelling in-flight reads. Debug invalidation uses it so making a file cold
+// does not abort a read that is already running.
+func (s *State) DropFileCache(fid string) {
+	s.dropFastPath(fid)
+	s.dropSequential(fid)
 	if s.cache != nil {
 		s.cache.InvalidateFile(fid)
 	}
+}
+
+// dropFastPath removes one file's hot chunks and range-hit counters. The hot
+// chunk key is fid + NUL + chunk index, so a byte-wise prefix match cannot
+// collide with another file id.
+func (s *State) dropFastPath(fid string) {
+	prefix := fid + "\x00"
+	s.fastPath.hot.mu.Lock()
+	keptChunks := s.fastPath.hot.chunks
+	if len(keptChunks) > 0 {
+		s.fastPath.hot.chunks = make(map[string][]byte, len(keptChunks))
+	}
+	keptLRU := s.fastPath.hot.lru[:0]
+	for _, key := range s.fastPath.hot.lru {
+		if strings.HasPrefix(key, prefix) {
+			delete(keptChunks, key)
+			continue
+		}
+		keptLRU = append(keptLRU, key)
+		if data, ok := keptChunks[key]; ok {
+			s.fastPath.hot.chunks[key] = data
+		}
+	}
+	s.fastPath.hot.lru = keptLRU
+	s.fastPath.hot.mu.Unlock()
+
+	s.fastPath.rangeHit.mu.Lock()
+	keptHits := s.fastPath.rangeHit.hits
+	if len(keptHits) > 0 {
+		s.fastPath.rangeHit.hits = make(map[string]int, len(keptHits))
+	}
+	keptRangeLRU := s.fastPath.rangeHit.lru[:0]
+	for _, key := range s.fastPath.rangeHit.lru {
+		if strings.HasPrefix(key, prefix) {
+			delete(keptHits, key)
+			continue
+		}
+		keptRangeLRU = append(keptRangeLRU, key)
+		if hits, ok := keptHits[key]; ok {
+			s.fastPath.rangeHit.hits[key] = hits
+		}
+	}
+	s.fastPath.rangeHit.lru = keptRangeLRU
+	s.fastPath.rangeHit.mu.Unlock()
+}
+
+// dropSequential forgets the access-pattern hints for one file so an
+// invalidation also resets prefetch decisions.
+func (s *State) dropSequential(fid string) {
+	s.sequence.mu.Lock()
+	kept := s.sequence.order[:0]
+	for _, key := range s.sequence.order {
+		if key.cacheKey == fid {
+			delete(s.sequence.reads, key)
+			continue
+		}
+		kept = append(kept, key)
+	}
+	s.sequence.order = kept
+	s.sequence.mu.Unlock()
 }
 
 // PutLocalFile seeds the cache from a local file.
@@ -761,5 +886,31 @@ func (s *State) DebugSnapshot() readcache.DebugReadCache {
 
 // StatesReady reports whether the runtime sub-states are initialized.
 func (s *State) StatesReady() bool {
-	return s != nil && s.prefetch != nil && s.sequence != nil && s.slots != nil && s.fastPath != nil && s.windows != nil
+	return s != nil && s.scheduler != nil && s.sequence != nil && s.fastPath != nil && s.windows != nil && s.scopes != nil
+}
+
+// attachWindow registers a live foreground dependency under the same lock used
+// for abandonment, so cancellation cannot race a newly attached waiter.
+func (s *State) attachWindow(load *windowLoad) (func(), bool) {
+	s.windows.mu.Lock()
+	defer s.windows.mu.Unlock()
+	if load.abandoned {
+		return nil, false
+	}
+	load.waiters++
+	var once sync.Once
+	return func() { once.Do(func() { s.windows.mu.Lock(); load.waiters--; s.windows.mu.Unlock() }) }, true
+}
+func (s *State) abandonWindow(load *windowLoad, session uint64, scopeEnded bool) bool {
+	s.windows.mu.Lock()
+	defer s.windows.mu.Unlock()
+	allowed := scopeEnded && load.waiters == 0 || !scopeEnded && session != 0 && load.sessionID == session && load.waiters == 1
+	if !allowed || load.abandoned {
+		return false
+	}
+	load.abandoned = true
+	if s.windows.loads[load.key] == load {
+		delete(s.windows.loads, load.key)
+	}
+	return true
 }

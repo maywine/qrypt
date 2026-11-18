@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"os"
@@ -12,33 +13,35 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/yinzhenyu/qrypt/pkg/crypt"
+	"github.com/yinzhenyu/qrypt/pkg/drive"
 	"github.com/yinzhenyu/qrypt/pkg/util"
 )
 
 type Config struct {
-	Version            string          `toml:"version"`
-	Mount              MountOptions    `toml:"mount"`
-	MountPoint         string          `toml:"mount_point"`
-	VolumeName         string          `toml:"volume_name"`
-	ReadOnly           bool            `toml:"read_only"`
-	AllowOther         bool            `toml:"allow_other"`
-	DefaultPermissions bool            `toml:"default_permissions"`
-	AttrTimeout        string          `toml:"attr_timeout"`
-	EntryTimeout       string          `toml:"entry_timeout"`
-	NegativeTimeout    string          `toml:"negative_timeout"`
-	TotalSpace         string          `toml:"total_space"`
-	FreeSpace          string          `toml:"free_space"`
-	Logging            LoggingConfig   `toml:"logging"`
-	Debug              DebugConfig     `toml:"debug"`
-	Time               TimeConfig      `toml:"time"`
-	Bandwidth          BandwidthConfig `toml:"bandwidth"`
-	Storage            StorageConfig   `toml:"storage"`
-	ReadCache          ReadCacheConfig `toml:"read_cache"`
-	ThumbnailCache     ReadCacheConfig `toml:"thumbnail_cache"`
-	Upload             UploadConfig    `toml:"upload"`
-	Encryption         crypt.Config    `toml:"encryption"`
-	Defaults           Defaults        `toml:"defaults"`
-	Mounts             []MountConfig   `toml:"mounts"`
+	Version            string             `toml:"version"`
+	Mount              MountOptions       `toml:"mount"`
+	MountPoint         string             `toml:"mount_point"`
+	VolumeName         string             `toml:"volume_name"`
+	ReadOnly           bool               `toml:"read_only"`
+	AllowOther         bool               `toml:"allow_other"`
+	DefaultPermissions bool               `toml:"default_permissions"`
+	AttrTimeout        string             `toml:"attr_timeout"`
+	EntryTimeout       string             `toml:"entry_timeout"`
+	NegativeTimeout    string             `toml:"negative_timeout"`
+	TotalSpace         string             `toml:"total_space"`
+	FreeSpace          string             `toml:"free_space"`
+	Logging            LoggingConfig      `toml:"logging"`
+	Debug              DebugConfig        `toml:"debug"`
+	Time               TimeConfig         `toml:"time"`
+	Bandwidth          BandwidthConfig    `toml:"bandwidth"`
+	Storage            StorageConfig      `toml:"storage"`
+	ReadCache          ReadCacheConfig    `toml:"read_cache"`
+	ThumbnailCache     ReadCacheConfig    `toml:"thumbnail_cache"`
+	Upload             UploadConfig       `toml:"upload"`
+	Encryption         crypt.Config       `toml:"encryption"`
+	Defaults           Defaults           `toml:"defaults"`
+	Credentials        []CredentialConfig `toml:"credentials"`
+	Mounts             []MountConfig      `toml:"mounts"`
 }
 
 type MountOptions struct {
@@ -62,11 +65,22 @@ type Defaults struct {
 type MountConfig struct {
 	Name        string           `toml:"name"`
 	Type        string           `toml:"type"`
+	Credential  string           `toml:"credential"`
 	TestEnabled bool             `toml:"test_enabled"`
 	Params      ParamMap         `toml:"params"`
 	Encryption  *crypt.Config    `toml:"encryption"`
 	ReadCache   *ReadCacheConfig `toml:"read_cache"`
+	Read        *ReadConfig      `toml:"read"`
 	Upload      *UploadConfig    `toml:"upload"`
+}
+
+// CredentialConfig is a named credential shared by any number of mounts of the
+// same account. Params carry credential-scope driver parameters; path- and
+// instance-scope parameters stay on each mount.
+type CredentialConfig struct {
+	Name   string   `toml:"name"`
+	Type   string   `toml:"type"`
+	Params ParamMap `toml:"params"`
 }
 
 type ParamMap map[string]string
@@ -109,6 +123,55 @@ type StorageConfig struct {
 
 type ReadCacheConfig struct {
 	MaxSize string `toml:"max_size"`
+}
+
+// ReadConfig is the optional mount override. Nil fields inherit recommendations.
+type ReadConfig struct {
+	MaxInFlight *int            `toml:"max_in_flight"`
+	Bulk        *BulkReadConfig `toml:"bulk"`
+}
+type BulkReadConfig struct {
+	Streams         *int    `toml:"streams"`
+	Window          *string `toml:"window"`
+	PartSize        *string `toml:"part_size"`
+	MinParallelSize *string `toml:"min_parallel_size"`
+}
+
+func (c *ReadConfig) Override() (*drive.ReadOverride, error) {
+	if c == nil {
+		return nil, nil
+	}
+	o := &drive.ReadOverride{MaxInFlight: c.MaxInFlight}
+	if c.Bulk == nil {
+		return o, nil
+	}
+	o.BulkStreams = c.Bulk.Streams
+	for _, field := range []struct {
+		name       string
+		value      *string
+		target     **int64
+		zero, auto bool
+	}{
+		{"window", c.Bulk.Window, &o.BulkWindowBytes, false, false},
+		{"part_size", c.Bulk.PartSize, &o.PartBytes, false, true},
+		{"min_parallel_size", c.Bulk.MinParallelSize, &o.MinParallelBytes, true, false},
+	} {
+		if field.value == nil {
+			continue
+		}
+		v := strings.TrimSpace(*field.value)
+		n := int64(0)
+		if !field.auto || v != "auto" {
+			var err error
+			// Read sizes accept IEC suffixes, as well as the existing K/M shorthand.
+			n, err = ParseSize(v)
+			if err != nil || v == "" || n < 0 || (!field.zero && n == 0) || n > drive.MaxReadWindowBytes {
+				return nil, fmt.Errorf("read.bulk.%s: require a size up to 32 MiB%s", field.name, map[bool]string{true: " (auto selects even division)", false: ""}[field.auto])
+			}
+		}
+		*field.target = &n
+	}
+	return o, nil
 }
 
 type UploadConfig struct {
@@ -188,6 +251,11 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	for _, key := range metadata.Keys() {
+		if len(key) >= 2 && key[0] == "mounts" && key[1] == "read_profile" {
+			return nil, fmt.Errorf("mounts.read_profile has been removed; use [mounts.read] max_in_flight and [mounts.read.bulk] streams/window/part_size/min_parallel_size; omit inherited values, replace chunk counts with bytes and part_chunks=0 with part_size=\"auto\"")
+		}
+	}
 	if undecoded := metadata.Undecoded(); len(undecoded) > 0 {
 		keys := make([]string, 0, len(undecoded))
 		for _, key := range undecoded {
@@ -205,8 +273,35 @@ var saveMu sync.Mutex
 // Save writes cfg to path atomically: the data is written to a temporary
 // file in the same directory, synced, and renamed over the target. A reader
 // never observes a truncated or half-written config. Concurrent saves are
-// serialized.
+// serialized. This compatibility entry point has no cancellation; callers that
+// own a context should use SaveContext.
 func Save(path string, cfg *Config) error {
+	return save(path, cfg, nil, util.WriteAtomicWithOptions)
+}
+
+// SaveContext is Save with cancellation checks before serialization, after
+// acquiring the save lock, and immediately before the atomic rename. A canceled
+// context leaves the destination byte-for-byte unchanged and removes the
+// temporary file. The rename is the commit point.
+func SaveContext(ctx context.Context, path string, cfg *Config) error {
+	if ctx == nil {
+		return fmt.Errorf("config: context required")
+	}
+	return save(path, cfg, ctx.Err, func(path string, opts util.AtomicWriteOptions, write func(*os.File) error) error {
+		return util.WriteAtomicWithOptionsContext(ctx, path, opts, write)
+	})
+}
+
+func save(path string, cfg *Config, check func() error, writeAtomic func(string, util.AtomicWriteOptions, func(*os.File) error) error) error {
+	checkErr := func() error {
+		if check == nil {
+			return nil
+		}
+		return check()
+	}
+	if err := checkErr(); err != nil {
+		return err
+	}
 	if cfg == nil {
 		return fmt.Errorf("config: configuration is empty")
 	}
@@ -214,9 +309,15 @@ func Save(path string, cfg *Config) error {
 	if err != nil {
 		return err
 	}
+	if err := checkErr(); err != nil {
+		return err
+	}
 	saveMu.Lock()
 	defer saveMu.Unlock()
-	return util.WriteAtomicWithOptions(path, util.AtomicWriteOptions{
+	if err := checkErr(); err != nil {
+		return err
+	}
+	return writeAtomic(path, util.AtomicWriteOptions{
 		Pattern:      filepath.Base(path) + ".tmp-*",
 		Mode:         0o600,
 		Replace:      true,
@@ -291,6 +392,42 @@ func (c *Config) UploadFor(mountName string) UploadConfig {
 	return upload
 }
 
+// CredentialFor returns the named credential definition.
+func (c *Config) CredentialFor(name string) (CredentialConfig, bool) {
+	if c == nil || name == "" {
+		return CredentialConfig{}, false
+	}
+	for _, cred := range c.Credentials {
+		if cred.Name == name {
+			return cred, true
+		}
+	}
+	return CredentialConfig{}, false
+}
+
+// ResolveMountParams merges the referenced credential's params with the mount's
+// own params. Mount values win for "both"-scope parameters, and a mount without
+// a credential reference keeps its inline params unchanged (legacy).
+func (c *Config) ResolveMountParams(mount MountConfig) (drive.Params, error) {
+	params := drive.Params{}
+	if mount.Credential != "" {
+		cred, ok := c.CredentialFor(mount.Credential)
+		if !ok {
+			return nil, fmt.Errorf("config: mount %q references unknown credential %q", mount.Name, mount.Credential)
+		}
+		if cred.Type != mount.Type {
+			return nil, fmt.Errorf("config: mount %q type %q does not match credential %q type %q", mount.Name, mount.Type, cred.Name, cred.Type)
+		}
+		for key, value := range cred.Params {
+			params[key] = value
+		}
+	}
+	for key, value := range mount.Params {
+		params[key] = value
+	}
+	return params, nil
+}
+
 func (c *Config) EffectiveMountPoint() string {
 	if c == nil {
 		return ""
@@ -363,7 +500,7 @@ func (c *Config) EffectiveVolumeName() string {
 func (c *Config) EffectiveMountOptions() map[string][]string {
 	if c == nil || c.Mount.Options == nil {
 		return map[string][]string{
-			"darwin": {"defer_permissions", "auto_xattr", "iosize=4194304"},
+			"darwin": {"defer_permissions", "auto_xattr", "iosize=4194304", "daemon_timeout=0"},
 		}
 	}
 	options := make(map[string][]string, len(c.Mount.Options))
@@ -481,6 +618,7 @@ func ParseSize(value string) (int64, error) {
 	}
 	upper := strings.ToUpper(value)
 	upper = strings.TrimSuffix(upper, "B")
+	upper = strings.TrimSuffix(upper, "I")
 
 	multiplier := int64(1)
 	switch {

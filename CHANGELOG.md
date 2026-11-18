@@ -1,5 +1,150 @@
 # Changelog
 
+## v0.7.0 (2026-11-16)
+
+### Features
+- feat(read): 统一读取策略并由消费字节驱动会话预取
+- feat: read pipeline, upload scheduling, and probe tooling since v0.6.1
+- feat(drivers): let a read profile keep a fixed parallel part size and a minimum window that may be split (`part_chunks`, `min_split_chunks`), and reproduce Quark's v0.6.1 read shape as its default
+- feat(vfs): bound read fetches with an idle and total timeout, retry a timed-out Range GET once, and cancel timed-out prefetches silently
+- feat(vfs): add read intents, driver read profiles, and bounded parallel range reads
+- feat(vfs): cancel speculative prefetch on invalidation, session release, and caller cancel
+- feat(vfs): skip durable read-cache writes for bulk and probe reads
+- feat(cli): download directory files and sync files with four workers
+- feat(probe): add an upload probe with stall/truncate/not-found fault injection
+- feat(probe): add a raw driver read concurrency benchmark
+- feat(probe): clear one mount's read cache so scripts can measure cold-cache load time
+- feat(probe): measure a sequential read sub-range and invalidate one file's read cache
+- feat(probe): inject read stalls, truncation, retryable statuses, and open delays
+- feat(probe): override read fetch timeouts for one measurement
+- feat(drivers): expose Quark penalized edges and download rotations in the driver snapshot
+- feat(probe): add an upload concurrency and chunk-size benchmark
+- feat(drivers): expose an upload profile so probes can sweep part size and part concurrency
+- feat(vfs): prefetch the next read-stream window
+
+### Bug fixes
+- fix(cli): escape config paths in the probe cache tests
+- fix(drive): end an abandoned direct read with the stall cancel cause, so a driver rotates away from a connection that stopped delivering instead of keeping it
+- fix(drive): share one per-file in-flight budget across concurrent direct readers, counting the probe, the whole-file stream, and every part, so a concurrent copy cannot double a file's concurrency
+- fix(vfs): unregister a lookahead the foreground gives up on before cancelling it, and take over a speculative load that ends in cancellation, so the read no longer returns `context.Canceled` while its own context is valid
+- fix(vfs): keep a stage's explicit prefetch depth through the FUSE sequential bulk upgrade instead of falling back to the adaptive lookahead count
+- fix(drive): stop counting a local bandwidth-limit wait as provider idle time, so a rate-limited mount no longer times out and replays fetches the provider already served
+- fix(vfs): take a speculative window's global slot before its per-file permit, skip when either is busy, and run it on the permits taken at admission, so a queued prefetch can no longer deadlock a foreground read
+- fix(vfs): honour a stage prefetch depth that is declared without a prefetch window instead of falling back to the adaptive window count
+- fix(drive): apply a mount read-profile override that names only a stage suggestion or the per-file in-flight budget
+- fix(drive): clamp a per-file in-flight budget to the driver's hard parallel limit instead of only clamping the stream count
+- fix(drive): put a mount's read profile to work in direct reads too, so `fs get` and share fetch use the configured part size, split threshold, and in-flight budget
+- fix(config): keep an explicit zero `part_chunks`/`min_split_chunks` distinct from an omitted one, so a mount can clear a driver's fixed part size or threshold
+- fix(vfs): stop a stalled speculative window from gating a foreground read for tens of seconds; the read fetches its own window after a 3 s wait and cancels the lookahead
+- fix(drivers): rotate a Quark connection only when the fetch was abandoned for a stall or the body was truncated, so a throttled connection is not reused forever while seeks still keep their pool
+- fix(vfs): cancel only the seeking session's lookahead, and let a driver declare per-stage seek/sequential windows plus an opt-in per-file Range budget
+- fix(drivers): stop aborting, penalizing, and rotating Quark downloads on slow-but-moving bodies or lifecycle cancellations; the throughput floor is gone and only real transfer failures rotate the connection
+- fix(drive): keep the total-timeout kind when the provider body reports the deadline itself instead of degrading to a bare context error
+- fix(vfs): confirm a suspect child with a fresh listing before reporting ENOTEMPTY, so `rmdir` right after `rm` no longer fails when the child's delayed delete finished mid-check
+- fix(vfs): fail a stalled provider read with a timeout instead of blocking the mount, and bound the read probe's own waits
+- fix(vfs): stop prefetch after deleting a file or closing a handle (#20)
+- fix(drivers): upload Quark content hashes in lowercase and answer EOF reads correctly
+- fix(crypt): give the raw driver the encrypted size so the final block decrypts
+- fix(crypt): forward read capabilities and profiles from the raw driver
+- fix(drivers): keep Drime, Koofr, and 123 bulk reads single-stream after measurement
+- fix(drivers): hand Quark range reads to the shared read layer so a stalled CDN body hits the idle timeout instead of the five-minute fetch budget
+- fix(vfs): replay a truncated Range body once in the shared read layer instead of requiring each driver to retry it
+- fix(drivers): refetch a Quark download URL when a cancelled prefetch aborts the shared request
+- fix(drivers): cap a Quark Range fetch at 90 seconds and rotate the download connection after a failed body read
+- fix(drivers): abort a Quark body that sustains a fraction of the recent best rate and replay it on a fresh connection
+- fix(crypt): report a ciphertext block that ends early as a truncated read instead of a decryption failure
+- fix(drivers): bound Quark download response headers to 10 seconds and reconnect after the wait times out
+- fix(drivers): skip Quark CDN edges that recently timed out or stalled
+- fix(drivers): keep Quark bulk reads single-stream by default after measurement
+- fix(vfs): keep caller-cancelled operations out of mount health
+- fix(vfs): treat a missing upload target as permanent instead of retrying forever
+- fix(vfs): bound consecutive upload retries so a stuck upload cannot loop indefinitely
+- fix(sftp): classify staging errors so a missing target reports not found
+- fix(koofr): give large uploads a size-derived budget and an idle-progress watchdog
+- fix(webdav): let a single PUT outlive the 30-second API timeout, bounded by a size-derived budget
+- fix(yun139): give upload parts a size-derived budget instead of the 60-second API timeout
+- fix(vfs): count in-flight remote deletes when reporting idle
+
+### Others
+- ci: bump the github-actions group with 6 updates (#24)
+- ci: 补强测试门禁并加速慢包测试 (#23)
+- test(read): 消除零偏移预热用例的采样竞态
+- test(drive): 放宽渐进读取超时边界用例的时间界
+- test(quark): measure the part-upload throttle instead of a deadline error
+- test(vfs): cover the probe read-fault, read-plan and prefetch APIs
+- test(cli): ignore go-winio's process-global IOCP goroutine in the leak check
+- refactor(vfs): resolve read plans once, consolidate prefetch lifetimes, and unify cache admission
+- refactor(vfs): centralize read concurrency budgets in one scheduler
+- refactor(drive): share the read concurrency budget with direct reads
+- refactor(vfs): treat plan streams as a hint and record scheduler-granted streams
+- fix(probe): tolerate provider-specific roots, blocked extensions, and evicted read events
+
+---
+
+## v0.6.1 (2026-11-02)
+
+### Features
+- feat(drivers): add Koofr backend (#14)
+- feat(drivers): refine optional driver and share contracts
+- feat(drivers): add drime backend
+
+### Bug fixes
+- fix(vfs): clear permanent upload failures and probe leftovers (#17)
+- fix(mount): stop macFUSE from ejecting slow network reads
+
+### Others
+- docs(openspec): propose driver contract refinements
+- docs(agents): 新增 Agents 标题与敏感信息提交约定
+- docs(skills): add a qrypt-tests skill for manual test runs
+- ci(contract): run only unattended-safe mounts on the nightly schedule
+- ci(contract): check the mount before the suite and surface init failures
+- test(vfs): tolerate duplicate prefetch in the canceled-list retry test
+- docs(drivers): show interactive login in the capability matrix
+- test(config): cover credential and mount store helpers
+
+### Thanks
+- @dwdcth for contributing the Koofr driver (#14)
+
+---
+
+## v0.6.0 (2026-10-24)
+
+### Features
+- feat(credential): add quark QR login and mount wizard
+- feat(cli): manage credentials and mounts
+- feat(credentials): share one session lifecycle across mounts
+- feat(config): add shared credentials and parameter scopes
+- feat(offline): add 115 cloud drive offline download
+- feat(receive): prompt for mount and passcode when ambiguous
+- feat(share): add share links and receive (转存) support
+- feat(ci): implement caching and installation script for WinFsp MSI
+
+### Bug fixes
+- fix(credentials): fall back to static credentials on auth failure
+- fix(credentials): force aliyun refresh and lock quarantine
+- fix(credentials): reuse fresh tokens and harden session recovery
+- fix(credentials): complete auth recovery and lifecycle visibility
+- fix(credentials): address review findings
+- fix(ci): use active Go toolchain formatter
+- fix(vfs): enforce upload domain ownership
+- fix(vfs): serialize namespace invalidation subscriptions
+- fix(vfs): close upload, rename and delete integrity gaps
+
+### Others
+- refactor(credentials): migrate drivers to shared CredentialBinding
+- refactor(credentials): add generic binding and migrate quark
+- docs(openspec): propose shared credential lifecycle
+- docs(agents): require gofmt after Go changes
+- ci: enforce architecture from Go metadata
+- ci: require shellcheck for installer checks
+- docs(vfs): define upload generation ownership
+- refactor(vfs): deepen upload domain
+- perf(vfs): stop copying frozen staging for appends, count the rest
+- test(vfs): allow slow uploads on Windows CI
+- docs(openspec): add make-vfs-mutations-recoverable and align boundaries
+
+---
+
 ## v0.5.6 (2026-10-22)
 
 ### Features

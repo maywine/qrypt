@@ -93,6 +93,57 @@ printf '%s' "$PASSWORD" | qrypt config export-rclone-password --password-stdin
 
 直接输入密码时优先使用 `--password-file` 或 `--password-stdin`。`--password` 会暴露在 shell 历史和进程参数中。
 
+### 共享凭据
+
+同一账号挂载多个目录时，凭据只维护一份：
+
+```sh
+qrypt credential login --type quark
+qrypt credential add main --type quark --param cookie="..."
+qrypt credential list
+qrypt credential show main
+qrypt credential set main --param cookie="..."
+qrypt credential remove main
+```
+
+`credential login` 通过扫码获取 cookie 并保存为共享凭据，详见[夸克网盘扫码登录](quark-login.md)。也可以在已有 cookie 时直接 `credential add`。
+
+凭据保存账号级参数（cookie、refresh token、用户名密码等），轮换与刷新由 qrypt 统一维护。`credential remove` 要求先移除引用它的挂载；加 `--purge` 会同时删除已持久化的会话目录。`qrypt credential test NAME [--param k=v]` 可以只认证一次而不挂载，用于确认凭据和网络是否可用。
+
+已有内联凭据的旧挂载可以一次性转换：
+
+```sh
+qrypt credential adopt docs --name main
+qrypt credential adopt docs --name main --delete-legacy
+```
+
+它会把挂载里的凭据级参数移到新凭据、让挂载引用该凭据，并在账号匹配时采纳旧的轮换状态；`--delete-legacy` 才会删除旧的挂载状态文件。
+
+参数值支持 `key=@文件路径` 和 `key=-`（从标准输入读取），避免密钥进入 shell 历史：
+
+```sh
+qrypt credential add main --type quark --param cookie=@cookie.txt
+printf '%s' "$COOKIE" | qrypt credential add main --type quark --param cookie=-
+```
+
+### 管理挂载
+
+```sh
+qrypt mount add docs --credential main --param root_path=/Docs
+qrypt mount add photos --credential main --param root_path=/Photos --password "..."
+qrypt mount add vault --credential main --param root_path=/Vault --password "..." \
+  --salt "..." --filename-encryption obfuscate --filename-encoding base64 --content-dedup
+qrypt mount list
+qrypt mount set docs --param root_path=/Documents
+qrypt mount set docs --credential other-main
+qrypt mount set docs --password "new-secret" --force
+qrypt mount remove docs [--purge]
+```
+
+`mount add` 的驱动类型来自所选凭据，只需配置 `root_path` 等挂载级属性。加密参数与 `[mounts.encryption]` 一一对应：`--password` 启用加密，`--salt`、`--filename-encryption`（`standard`/`obfuscate`/`off`）、`--filename-encoding`（`base32`/`base64`）、`--content-dedup` 调整细节；除密码外的加密参数都必须与密码一起使用，密码可以通过 `--password`、`--password-file` 或 `--password-stdin` 提供。`mount set` 同样支持这些加密参数，但一旦启用加密就不能再退回明文模式；修改已有加密的密码、盐或文件名模式必须加 `--force`，因为远端已有数据可能无法再读取。`mount remove --purge` 会同时删除该挂载的本地状态目录；挂载名 `add`、`set`、`remove`、`list` 保留给子命令，名称冲突时用 `qrypt mount --name NAME` 单独挂载。
+
+配置文件的修改不会热更新到正在运行的挂载进程；执行 `qrypt config validate` 确认配置后，重启 `qrypt mount` 才会生效。
+
 ## 挂载
 
 ```sh
@@ -123,7 +174,7 @@ qrypt fs rm REMOTE [--wait-timeout DURATION] [--json]
 qrypt fs pending [--verbose | --json]
 qrypt fs journal [--config PATH | --cache-dir PATH] [--json]
 qrypt fs journal replay [--config PATH | --cache-dir PATH] [--json]
-qrypt fs journal prune [--config PATH | --cache-dir PATH] [--json]
+qrypt fs journal prune [--config PATH | --cache-dir PATH] [--json] [--failed]
 ```
 
 `fs` 命令组支持 `--config PATH`，既可写在子命令前，也可写在子命令后：
@@ -163,7 +214,7 @@ qrypt fs crypt-decode [MOUNT] "b4l6g..."     # 密文 → 明文（反查本地�
 
 ## 离线下载
 
-`offline` 命令组通过本机控制 socket 把远程资源交给网盘侧的离线下载服务，并在同一个任务模型里观察、控制和拉取结果。需要运行中的 `qrypt mount`，当前支持该能力的驱动为 `quark`。
+`offline` 命令组通过本机控制 socket 把远程资源交给网盘侧的离线下载服务，并在同一个任务模型里观察、控制和拉取结果。需要运行中的 `qrypt mount`，当前支持该能力的驱动为 `quark`、`115` 和 `115_open`。
 
 ```sh
 qrypt offline add SOURCE [--parse-to /MOUNT/DIR | --mount NAME] [--mkdir]
@@ -179,6 +230,7 @@ qrypt offline list [--all] [--state STATE] [--mount NAME] [--limit N] [--json]
 qrypt offline show TASK_ID [--json]
 qrypt offline cancel TASK_ID
 qrypt offline retry TASK_ID
+qrypt offline rm TASK_ID | --finished [--mount NAME]
 qrypt offline wait TASK_ID [--timeout DURATION] [--json]
 ```
 
@@ -190,7 +242,40 @@ qrypt offline wait <task-id>
 qrypt fs get /quark/downloads/<file> ./<file>
 ```
 
+`cancel` 只对仍在执行的任务有效；已结束的任务用 `qrypt offline rm` 从任务列表移除（不删除云盘或本地文件），`--finished` 一次移除全部已结束任务。
+
 来源格式、目的地规则、两阶段 fetch、并发参数和错误码见[离线下载](offline-download.md)。
+
+## 分享与接收
+
+`share` 命令组管理自己创建的分享链接（同步调用，不产生任务）；`receive` 命令组浏览、转存和下载别人的分享（转存与下载是持久化任务）。两者都通过本机控制 socket 与运行中的 Core 通信；provider 由挂载或链接识别，不需要 provider 名。当前支持该能力的驱动为 `quark`。
+
+```sh
+qrypt share create PATH... [--mount NAME] [--name TITLE]
+                          [--expires 1d|7d|30d|forever] [--passcode[=CODE]]
+                          [--limit-visits N] [--json]
+qrypt share list | show | update | remove ...
+qrypt receive inspect LINK [--passcode[=CODE]] [--mount NAME] [--dir ID] [--json]
+qrypt receive save  LINK (--to /MOUNT/DIR | --mount NAME)
+                          [--select ...] [--include GLOB] [--exclude GLOB]
+                          [--mkdir] [--new] [--idempotency-key KEY] [--no-wait]
+qrypt receive fetch LINK [--to /MOUNT/DIR] --download-to PATH
+                          [--keep-cloud] [--workers N] [--chunk-size SIZE]
+                          [--select ...] [--new] [--no-wait]
+qrypt receive list | show | cancel | retry | wait ...
+```
+
+`share` 的链接操作是同步的；`receive save/fetch` 默认阻塞到终态，`--no-wait` 在任务受理后返回。`--passcode=CODE` 指定提取码，只写 `--passcode` 时 `share` 生成新提取码、`receive` 从 stdin 读一行。提取码默认掩码，`--show-secrets` 才显示明文。部分条目失败时退出码为 `3`。
+
+常用流程：
+
+```sh
+qrypt share create /quark-download/report.pdf --expires 7d --passcode
+qrypt receive save https://pan.quark.cn/s/xxxx --to /quark-download/inbox --mkdir
+qrypt receive fetch https://pan.quark.cn/s/xxxx --to /quark-download/inbox --download-to ~/Downloads
+```
+
+链接与落点规则、提取码、同 provider 限制和错误码见[分享与接收](share.md)。
 
 ## 驱动信息
 
@@ -220,11 +305,16 @@ qrypt debug bundle [REMOTE] [--dest DESTINATION] --mount NAME --out FILE [--forc
 
 qrypt probe test TEST [probe flags]
 qrypt probe bench TEST [benchmark flags]
+qrypt probe cache clear --mount NAME
+qrypt probe cache invalidate --path REMOTE
+qrypt probe fault read --path REMOTE --kind KIND [flags]
+qrypt probe fault list
+qrypt probe fault clear [--id ID]
 ```
 
 `collect`、`watch` 和 `bundle` 需要用 `--mount NAME` 指定挂载；`--mount` 可重复传入，确需检查全部挂载时使用 `--all-mounts`。`debug watch --jsonl` 适合管道式消费。
 
-`probe test` / `probe bench` 只使用配置中设置了 `test_enabled = true` 的挂载。测试项、输出含义和完整调试流程见[调试文档](../for-developer/debug.md)。
+`probe test` / `probe bench` 只使用配置中设置了 `test_enabled = true` 的挂载。`probe cache clear` 清空指定挂载的持久化和内存读缓存，`probe cache invalidate --path` 只清理单个文件；两者都保持挂载运行，适合脚本测量缓存未命中的加载速度。`probe fault read` 在运行中的挂载上注入一次读故障（`stall`、`truncate`、`status` 或 `delay`），用于验证超时、重放和状态重试，规则用 `probe fault list/clear` 查看和清除。测试项、输出含义和完整调试流程见[调试文档](../for-developer/debug.md)。
 
 任务控制：
 

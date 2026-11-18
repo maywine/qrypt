@@ -17,10 +17,10 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -218,6 +218,542 @@ func TestDriverReadRetriesDownloadWithoutRefreshingURL(t *testing.T) {
 	}
 }
 
+func TestDriverReadClampsAtEOF(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/file/download" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		writeJSON(t, w, map[string]any{
+			"status": 200,
+			"code":   0,
+			"data": []map[string]any{
+				{"download_url": "https://download.quark.cn/file.bin"},
+			},
+		})
+	}))
+	defer api.Close()
+
+	var downloadCalls int
+	driver := New("k=v", Options{BaseURL: api.URL, V2URL: api.URL})
+	driver.cl.downloadClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		downloadCalls++
+		if got := req.Header.Get("Range"); got != "bytes=8-9" {
+			t.Fatalf("range = %q, want bytes=8-9", got)
+		}
+		return &http.Response{
+			StatusCode: http.StatusPartialContent,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("89")),
+			Request:    req,
+		}, nil
+	})
+
+	entry := drive.Entry{ID: "fid-eof", Name: "file.bin", Size: 10}
+	for _, offset := range []int64{10, 11} {
+		rc, err := driver.Read(context.Background(), entry, offset, 1)
+		if err != nil {
+			t.Fatalf("read at offset %d: %v", offset, err)
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatalf("read at offset %d body: %v", offset, err)
+		}
+		if len(data) != 0 {
+			t.Fatalf("read at offset %d returned %d bytes, want empty", offset, len(data))
+		}
+	}
+	if downloadCalls != 0 {
+		t.Fatalf("EOF reads issued %d download calls, want 0", downloadCalls)
+	}
+
+	rc, err := driver.Read(context.Background(), entry, 8, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "89" {
+		t.Fatalf("clamped read = %q, want 89", data)
+	}
+	if downloadCalls != 1 {
+		t.Fatalf("download calls = %d, want 1", downloadCalls)
+	}
+}
+
+func TestDriverReadStrictRangeRejectsWholeObject(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/file/download" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		writeJSON(t, w, map[string]any{
+			"status": 200,
+			"code":   0,
+			"data": []map[string]any{
+				{"download_url": "https://download.quark.cn/file.bin"},
+			},
+		})
+	}))
+	defer api.Close()
+
+	driver := New("k=v", Options{BaseURL: api.URL, V2URL: api.URL})
+	driver.cl.downloadClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("whole object")),
+			Request:    req,
+		}, nil
+	})
+
+	entry := drive.Entry{ID: "fid-strict", Name: "file.bin", Size: 100}
+	if _, err := driver.Read(drive.WithStrictRange(context.Background()), entry, 0, 10); !errors.Is(err, drive.ErrUnsupported) {
+		t.Fatalf("strict read error = %v, want drive.ErrUnsupported", err)
+	}
+	rc, err := driver.Read(context.Background(), entry, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "whole object" {
+		t.Fatalf("non-strict body = %q, want whole object", data)
+	}
+}
+
+func TestDriverReadPolicyPreservesLegacyReadShape(t *testing.T) {
+	d := New("cookie", Options{})
+	p := d.ReadPolicy()
+	if !drive.HasCapability(d, drive.CapabilityParallelRange) || drive.HasCapability(d, drive.CapabilityInternalParallelRead) {
+		t.Fatal("invalid read capability")
+	}
+	if p.Bulk.WindowBytes != 4<<20 || p.Bulk.Streams != 3 || p.Bulk.Split.PartBytes != 8<<20 || p.Bulk.Split.MinParallelBytes != 4<<20 {
+		t.Fatalf("bulk=%+v", p.Bulk)
+	}
+	if p.Interactive.Sequential.Window.Mode != drive.WindowCaller || p.Interactive.Sequential.Prefetch != (drive.PrefetchPolicy{Mode: drive.PrefetchAdaptive}) {
+		t.Fatalf("interactive=%+v", p.Interactive)
+	}
+	if p.MaxInFlight != 7 {
+		t.Fatalf("file budget=%d, want room for four lookaheads plus three workers", p.MaxInFlight)
+	}
+	if p.Fetch.Total != downloadTotalTimeout || p.Fetch.Idle <= 0 || p.Fetch.Idle > p.Fetch.Total {
+		t.Fatalf("fetch=%+v", p.Fetch)
+	}
+}
+
+// failingReadBody fails on the first read, like a CDN connection reset.
+type failingReadBody struct{}
+
+func (failingReadBody) Read([]byte) (int, error) { return 0, errors.New("connection reset by peer") }
+func (failingReadBody) Close() error             { return nil }
+
+// TestDriverRotatesDownloadTransportAfterBodyFailure: a failed body read must
+// replace the download connection generation so a later read (or the read
+// layer's retry) does not reuse the degraded edge.
+func TestDriverRotatesDownloadTransportAfterBodyFailure(t *testing.T) {
+	const downloadURL = "https://download.quark.cn/file.bin"
+	driver := New("k=v", Options{})
+	driver.setURL("fid-1", downloadURL)
+	driver.downloadWarmupDone.Store(downloadURL, struct{}{})
+	entry := drive.Entry{ID: "fid-1", Name: "file.bin", Size: 4096}
+	driver.cl.downloadClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusPartialContent,
+			Header:     make(http.Header),
+			Body:       failingReadBody{},
+			Request:    req,
+		}, nil
+	})
+
+	before := driver.cl.downloadHTTP()
+	rc, err := driver.Read(context.Background(), entry, 0, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, rc); err == nil {
+		t.Fatal("expected the injected body failure")
+	}
+	rc.Close()
+	driver.cl.downloadMu.RLock()
+	dirty := driver.cl.downloadDirty
+	driver.cl.downloadMu.RUnlock()
+	if !dirty {
+		t.Fatal("body failure did not mark the download connection stale")
+	}
+
+	// The next request swaps generations instead of reusing the failed one.
+	after := driver.cl.downloadHTTP()
+	if after == before {
+		t.Fatal("download transport was not rotated after a body failure")
+	}
+
+	// A seek cancels prefetch windows frequently; rotation is throttled so a
+	// healthy pool is not discarded on every cancel.
+	driver.cl.markDownloadFailed("another failed body")
+	if got := driver.cl.downloadHTTP(); got != after {
+		t.Fatal("download transport rotated again within the throttle window")
+	}
+
+	driver.cl.downloadMu.Lock()
+	driver.cl.downloadRotated = time.Now().Add(-downloadRotateMinInterval - time.Second)
+	driver.cl.downloadMu.Unlock()
+	driver.cl.downloadMu.RLock()
+	dirty = driver.cl.downloadDirty
+	driver.cl.downloadMu.RUnlock()
+	if !dirty {
+		t.Fatal("throttled failure lost the stale mark")
+	}
+	if got := driver.cl.downloadHTTP(); got == after {
+		t.Fatal("download transport did not rotate after the throttle window")
+	}
+}
+
+// TestNewDownloadHTTPClientBoundsHeaderWait: a dead CDN edge must not consume
+// the retry budget in 30-second header waits.
+func TestNewDownloadHTTPClientBoundsHeaderWait(t *testing.T) {
+	driver := New("k=v", Options{})
+	transport, ok := driver.cl.newDownloadHTTPClient().Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("download transport is not *http.Transport")
+	}
+	if transport.ResponseHeaderTimeout != downloadResponseHeaderTimeout {
+		t.Fatalf("response header timeout = %s, want %s", transport.ResponseHeaderTimeout, downloadResponseHeaderTimeout)
+	}
+	if transport.ResponseHeaderTimeout > 15*time.Second {
+		t.Fatalf("response header timeout = %s, want a fast failure", transport.ResponseHeaderTimeout)
+	}
+}
+
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "i/o timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+// TestDriverRotatesDownloadTransportOnHeaderTimeout: a header timeout retries
+// on a fresh connection instead of waiting on the same dead edge again.
+func TestDriverRotatesDownloadTransportOnHeaderTimeout(t *testing.T) {
+	driver := New("k=v", Options{})
+	driver.cl.downloadClient.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, timeoutError{}
+	})
+	req, err := http.NewRequest(http.MethodGet, "https://download.quark.cn/file.bin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := driver.cl.downloadHTTP()
+	if _, err := driver.cl.doDownload(req, "k=v"); err == nil {
+		t.Fatal("expected the injected header timeout")
+	}
+	if driver.cl.downloadHTTP() == before {
+		t.Fatal("download transport was not rotated after a header timeout")
+	}
+}
+
+type pacedBody struct {
+	remaining int
+	delay     time.Duration
+	err       error
+}
+
+func (b *pacedBody) Read(p []byte) (int, error) {
+	time.Sleep(b.delay)
+	if b.remaining <= 0 {
+		if b.err != nil {
+			return 0, b.err
+		}
+		return 0, io.EOF
+	}
+	n := min(len(p), 1024, b.remaining)
+	b.remaining -= n
+	return n, nil
+}
+
+func (b *pacedBody) Close() error { return nil }
+
+// TestTraceReadCloserReportsBodyError: a body failure is reported once with
+// the bytes delivered and the provider time spent, so the driver can decide
+// whether the connection failed. A slow body must not be turned into a
+// synthetic truncated response.
+func TestTraceReadCloserReportsBodyError(t *testing.T) {
+	bodyErr := errors.New("connection reset by peer")
+	var reported error
+	trace := &traceReadCloser{
+		ReadCloser: &pacedBody{remaining: 1 << 10, err: bodyErr},
+		size:       1 << 20,
+		start:      time.Now(),
+		onError:    func(err error, _ int64, _ time.Duration) { reported = err },
+	}
+	if _, err := io.Copy(io.Discard, trace); !errors.Is(err, bodyErr) {
+		t.Fatalf("read error = %v, want the body error", err)
+	}
+	if !errors.Is(reported, bodyErr) {
+		t.Fatalf("reported error = %v, want the body error", reported)
+	}
+}
+
+// TestTraceReadCloserKeepsSlowBody: a body that keeps making progress far
+// below any historical rate must be delivered in full. Slow is not broken, and
+// aborting it would replay already-downloaded bytes.
+func TestTraceReadCloserKeepsSlowBody(t *testing.T) {
+	const total = 8 << 10
+	trace := &traceReadCloser{
+		ReadCloser: io.NopCloser(strings.NewReader(strings.Repeat("x", total))),
+		size:       total,
+		start:      time.Now().Add(-time.Minute),
+		onError:    func(err error, _ int64, _ time.Duration) { t.Fatalf("slow body reported %v", err) },
+	}
+	data, err := io.ReadAll(trace)
+	if err != nil {
+		t.Fatalf("slow body read: %v", err)
+	}
+	if len(data) != total {
+		t.Fatalf("slow body bytes = %d, want %d", len(data), total)
+	}
+}
+
+// TestDriverNeverRotatesOnLifecycleCancel: seek, close, released prefetch, and
+// the read layer's own bounds all cancel bodies. None of them is evidence of a
+// bad edge, so none may replace the connection pool or penalize the address.
+func TestDriverNeverRotatesOnLifecycleCancel(t *testing.T) {
+	driver := New("k=v", Options{})
+	stale := func(d *Driver) bool {
+		d.cl.downloadMu.RLock()
+		defer d.cl.downloadMu.RUnlock()
+		return d.cl.downloadDirty
+	}
+	for _, err := range []error{context.Canceled, context.DeadlineExceeded, errors.New("http: response body closed")} {
+		driver.noteDownloadBodyError(context.Background(), "1.2.3.4:443", err)
+		if stale(driver) {
+			t.Fatalf("%v marked the connection stale", err)
+		}
+		if driver.cl.edges.isBad(mustAddr(t, "1.2.3.4"), time.Now()) {
+			t.Fatalf("%v penalized the edge", err)
+		}
+	}
+
+	network := New("k=v", Options{})
+	network.noteDownloadBodyError(context.Background(), "", errors.New("connection reset by peer"))
+	if !stale(network) {
+		t.Fatal("a network failure did not mark the connection stale")
+	}
+
+	// The read layer abandons a stalled fetch and marks it with a cause. That
+	// is a connection that is not delivering, so the retry must not replay on
+	// it, even though the body itself reports a plain cancellation.
+	stalled := New("k=v", Options{})
+	stalledCtx, cancelStalled := context.WithCancelCause(context.Background())
+	cancelStalled(drive.ReadIdleStall)
+	stalled.noteDownloadBodyError(stalledCtx, "", context.Canceled)
+	if !stale(stalled) {
+		t.Fatal("a stalled fetch did not mark the connection stale")
+	}
+}
+
+// TestTraceReadCloserReportsShortBody: a provider that closes the connection
+// before the requested range is complete reports a clean EOF. The driver must
+// still see it as a transfer failure so the retry uses a fresh connection.
+func TestTraceReadCloserReportsShortBody(t *testing.T) {
+	var reported error
+	trace := &traceReadCloser{
+		ReadCloser: io.NopCloser(strings.NewReader("short")),
+		size:       1 << 20,
+		start:      time.Now(),
+		onError:    func(err error, _ int64, _ time.Duration) { reported = err },
+	}
+	if _, err := io.ReadAll(trace); err != nil {
+		t.Fatalf("short body read: %v", err)
+	}
+	if !errors.Is(reported, errDownloadShortBody) {
+		t.Fatalf("reported error = %v, want the short-body sentinel", reported)
+	}
+}
+
+// TestDriverKeepsSlowBodyWithoutRotation: a moving body that finishes must not
+// be replayed, rotated, or penalized no matter how slow it was.
+func TestDriverKeepsSlowBodyWithoutRotation(t *testing.T) {
+	const total = 64 << 10
+	driver := New("k=v", Options{})
+	driver.setURL("fid-slow", "https://download.quark.cn/slow.bin")
+	driver.downloadWarmupDone.Store("https://download.quark.cn/slow.bin", struct{}{})
+	driver.cl.downloadClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusPartialContent,
+			Header:     http.Header{"Content-Range": []string{fmt.Sprintf("bytes 0-%d/%d", total-1, total)}},
+			Body:       &pacedBody{remaining: total, delay: 2 * time.Millisecond},
+			Request:    req,
+		}, nil
+	})
+	entry := drive.Entry{ID: "fid-slow", Name: "slow.bin", Size: total}
+	rc, err := driver.Read(context.Background(), entry, 0, total)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("slow read: %v", err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != total {
+		t.Fatalf("slow read bytes = %d, want %d", len(data), total)
+	}
+	rotations, reason := driver.cl.downloadDebugSnapshot()
+	if rotations != 0 {
+		t.Fatalf("slow read rotated the pool: %d (%s)", rotations, reason)
+	}
+}
+
+// TestDriverLowDownloadLimitDoesNotRotate: a user download cap paces the
+// consumer; it must never look like a provider stall.
+func TestDriverLowDownloadLimitDoesNotRotate(t *testing.T) {
+	// The limiter paces strictly at the configured rate, so the request size
+	// sets the wall time (total / 8KiB/s). Keep it just large enough to show
+	// the cap in effect without spending seconds asleep.
+	const total = 8 << 10
+	driver := New("k=v", Options{})
+	driver.limiter = drive.NewBandwidthLimiter(drive.BandwidthLimits{DownloadBytesPerSecond: 8 << 10})
+	driver.setURL("fid-cap", "https://download.quark.cn/cap.bin")
+	driver.downloadWarmupDone.Store("https://download.quark.cn/cap.bin", struct{}{})
+	driver.cl.downloadClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusPartialContent,
+			Header:     http.Header{"Content-Range": []string{fmt.Sprintf("bytes 0-%d/%d", total-1, total)}},
+			Body:       io.NopCloser(bytes.NewReader(make([]byte, total))),
+			Request:    req,
+		}, nil
+	})
+	entry := drive.Entry{ID: "fid-cap", Name: "cap.bin", Size: total}
+	rc, err := driver.Read(context.Background(), entry, 0, total)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("capped read: %v", err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != total {
+		t.Fatalf("capped read bytes = %d, want %d", len(data), total)
+	}
+	if rotations, reason := driver.cl.downloadDebugSnapshot(); rotations != 0 {
+		t.Fatalf("capped read rotated the pool: %d (%s)", rotations, reason)
+	}
+}
+
+func TestDriverReadKeepsLargeRangeSingleStream(t *testing.T) {
+	const total = int64(16 << 20)
+	const downloadURL = "https://download.quark.cn/file.bin"
+	driver := New("k=v", Options{})
+	driver.setURL("fid-1", downloadURL)
+	driver.downloadWarmupDone.Store(downloadURL, struct{}{})
+	var mu sync.Mutex
+	var ranges []string
+	driver.cl.downloadClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		ranges = append(ranges, req.Header.Get("Range"))
+		mu.Unlock()
+		return &http.Response{
+			StatusCode: http.StatusPartialContent,
+			Header:     http.Header{"Content-Range": []string{fmt.Sprintf("bytes 0-%d/%d", total-1, total)}},
+			Body:       io.NopCloser(bytes.NewReader(make([]byte, total))),
+			Request:    req,
+		}, nil
+	})
+
+	entry := drive.Entry{ID: "fid-1", Name: "file.bin", Size: total}
+	rc, err := driver.Read(context.Background(), entry, 0, total)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(io.Discard, rc); err != nil {
+		t.Fatal(err)
+	}
+	rc.Close()
+	mu.Lock()
+	got := append([]string(nil), ranges...)
+	mu.Unlock()
+	want := fmt.Sprintf("bytes=0-%d", total-1)
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("range requests = %v, want one %q", got, want)
+	}
+}
+
+// TestDriverDownloadURLRetriesCancelledSharedFetch: a foreground read that
+// joined a prefetch's in-flight URL fetch must not inherit the prefetch's
+// cancellation when a seek drops that prefetch.
+func TestDriverDownloadURLRetriesCancelledSharedFetch(t *testing.T) {
+	const wantURL = "https://download.quark.cn/file.bin"
+	driver := New("k=v", Options{})
+	var calls atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	driver.cl.httpClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+			return nil, req.Context().Err()
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"status":200,"code":0,"data":[{"download_url":"` + wantURL + `"}]}`)),
+			Request: req,
+		}, nil
+	})
+
+	prefetchCtx, cancelPrefetch := context.WithCancel(context.Background())
+	defer cancelPrefetch()
+	prefetchErr := make(chan error, 1)
+	go func() {
+		_, err := driver.downloadURL(prefetchCtx, "fid-1")
+		prefetchErr <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("download URL request did not start")
+	}
+
+	type result struct {
+		value downloadURLResult
+		err   error
+	}
+	live := make(chan result, 1)
+	go func() {
+		value, err := driver.downloadURL(context.Background(), "fid-1")
+		live <- result{value: value, err: err}
+	}()
+	// Let the foreground caller join the in-flight fetch before it is aborted.
+	time.Sleep(20 * time.Millisecond)
+
+	cancelPrefetch()
+	close(release)
+	if err := <-prefetchErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("prefetch error = %v, want context.Canceled", err)
+	}
+	got := <-live
+	if got.err != nil {
+		t.Fatalf("foreground download URL error = %v, want a fresh fetch", got.err)
+	}
+	if got.value.url != wantURL {
+		t.Fatalf("foreground download URL = %q, want %q", got.value.url, wantURL)
+	}
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("download URL calls = %d, want the canceled fetch plus one retry", n)
+	}
+}
+
 func TestDriverDownloadUsesCookieSnapshotAfterRotation(t *testing.T) {
 	var apiCalls int
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -286,93 +822,6 @@ func TestDriverDownloadUsesCookieSnapshotAfterRotation(t *testing.T) {
 	}
 	if state.Cookie != "__puus=new" {
 		t.Fatalf("state cookie = %q, want rotated cookie", state.Cookie)
-	}
-}
-
-func TestDriverParallelDownloadAssemblesRangeParts(t *testing.T) {
-	const total = int64(24 * 1024 * 1024)
-	data := make([]byte, total)
-	for i := range data {
-		data[i] = byte(i)
-	}
-	driver := New("k=v", Options{})
-	var mu sync.Mutex
-	var ranges []string
-	active := 0
-	maxActive := 0
-	entered := make(chan struct{}, 3)
-	release := make(chan struct{})
-	driver.cl.downloadClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		value := req.Header.Get("Range")
-		var start, end int64
-		if _, err := fmt.Sscanf(value, "bytes=%d-%d", &start, &end); err != nil {
-			return nil, fmt.Errorf("parse range %q: %w", value, err)
-		}
-		mu.Lock()
-		ranges = append(ranges, value)
-		active++
-		if active > maxActive {
-			maxActive = active
-		}
-		mu.Unlock()
-		entered <- struct{}{}
-		<-release
-		body := append([]byte(nil), data[start:end+1]...)
-		mu.Lock()
-		active--
-		mu.Unlock()
-		return &http.Response{
-			StatusCode: http.StatusPartialContent,
-			Header:     http.Header{"Content-Range": []string{fmt.Sprintf("bytes %d-%d/%d", start, end, total)}},
-			Body:       io.NopCloser(bytes.NewReader(body)),
-			Request:    req,
-		}, nil
-	})
-
-	type downloadResult struct {
-		rc  io.ReadCloser
-		err error
-	}
-	result := make(chan downloadResult, 1)
-	go func() {
-		rc, err := driver.downloadParallel(context.Background(), "fid-1", "https://download.quark.cn/file.bin", "k=v", false, 0, total)
-		result <- downloadResult{rc: rc, err: err}
-	}()
-	for range 3 {
-		select {
-		case <-entered:
-		case <-time.After(time.Second):
-			t.Fatal("parallel range workers did not start")
-		}
-	}
-	close(release)
-	item := <-result
-	rc, err := item.rc, item.err
-	if err != nil {
-		t.Fatal(err)
-	}
-	got, err := io.ReadAll(rc)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, data) {
-		t.Fatalf("assembled data differs: got=%d want=%d", len(got), len(data))
-	}
-	if len(ranges) != 3 {
-		t.Fatalf("range request count = %d, want 3: %v", len(ranges), ranges)
-	}
-	wantRanges := []string{
-		"bytes=0-8388607",
-		"bytes=8388608-16777215",
-		"bytes=16777216-25165823",
-	}
-	slices.Sort(ranges)
-	slices.Sort(wantRanges)
-	if !slices.Equal(ranges, wantRanges) {
-		t.Fatalf("range requests = %v, want %v", ranges, wantRanges)
-	}
-	if maxActive < 2 {
-		t.Fatalf("max concurrent range requests = %d, want at least 2", maxActive)
 	}
 }
 
@@ -503,11 +952,16 @@ func TestDriverReadWarmsDownloadConnectionOnce(t *testing.T) {
 	driver.setURL("fid-1", "https://download.quark.cn/file.bin")
 	var ranges []string
 	driver.cl.downloadClient.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		ranges = append(ranges, req.Header.Get("Range"))
+		rangeHeader := req.Header.Get("Range")
+		ranges = append(ranges, rangeHeader)
+		// Answer the full requested span: a short body is a provider failure,
+		// and this test is about the warmup request, not truncation.
+		body := bytes.Repeat([]byte("x"), rangeBodyLen(rangeHeader))
+		copy(body, "hello")
 		return &http.Response{
 			StatusCode: http.StatusPartialContent,
 			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader("hello")),
+			Body:       io.NopCloser(bytes.NewReader(body)),
 			Request:    req,
 		}, nil
 	})
@@ -517,8 +971,9 @@ func TestDriverReadWarmsDownloadConnectionOnce(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if data, err := io.ReadAll(rc); err != nil || string(data) != "hello" {
-			t.Fatalf("read at %d = %q/%v, want hello/nil", offset, data, err)
+		data, readErr := io.ReadAll(rc)
+		if readErr != nil || len(data) != 1<<20 || string(data[:5]) != "hello" {
+			t.Fatalf("read at %d len=%d err=%v, want 1 MiB starting with hello", offset, len(data), readErr)
 		}
 		_ = rc.Close()
 	}
@@ -529,6 +984,24 @@ func TestDriverReadWarmsDownloadConnectionOnce(t *testing.T) {
 	if got := metricCount(driver.cl.metricEvents(time.Time{}), "download_warmup"); got != 1 {
 		t.Fatalf("download warmup metrics = %d, want 1", got)
 	}
+}
+
+// rangeBodyLen returns the byte count a "bytes=first-last" header requests.
+func rangeBodyLen(header string) int {
+	spec, ok := strings.CutPrefix(header, "bytes=")
+	if !ok {
+		return 0
+	}
+	first, last, ok := strings.Cut(spec, "-")
+	if !ok {
+		return 0
+	}
+	start, errStart := strconv.ParseInt(first, 10, 64)
+	end, errEnd := strconv.ParseInt(last, 10, 64)
+	if errStart != nil || errEnd != nil || end < start {
+		return 0
+	}
+	return int(end - start + 1)
 }
 
 func TestDriverDebugSnapshot(t *testing.T) {
@@ -548,6 +1021,12 @@ func TestDriverDebugSnapshot(t *testing.T) {
 	}
 	if snapshot.Extra[drive.DebugExtraCredentialSource] == nil {
 		t.Fatalf("expected credential_source extra, got %+v", snapshot.Extra)
+	}
+	if _, ok := snapshot.Stats["download_rotations"]; !ok {
+		t.Fatalf("missing download rotation stats: %+v", snapshot.Stats)
+	}
+	if _, ok := snapshot.Stats["penalized_edges"]; !ok {
+		t.Fatalf("missing penalized edge stats: %+v", snapshot.Stats)
 	}
 }
 
@@ -586,6 +1065,304 @@ func TestLoadCookieStateOverridesConfigCookie(t *testing.T) {
 	if driver.cookieSource != "state" {
 		t.Fatalf("cookieSource = %q, want state", driver.cookieSource)
 	}
+}
+
+// TestLoadCookieStateCredentialBinding pins which persisted sessions may
+// replace the configured credential: rotation state survives restarts only for
+// the same configured cookie, while a replaced credential (another account,
+// or a freshly exported cookie) always wins.
+func TestLoadCookieStateCredentialBinding(t *testing.T) {
+	const (
+		accountA = "__uid=account-a; __puus=a"
+		accountB = "__uid=account-b; __puus=b"
+	)
+	tests := []struct {
+		name         string
+		configCookie string
+		state        cookieState
+		wantCookie   string
+		wantSource   string
+	}{
+		{
+			name:         "adopts rotated session for the configured credential",
+			configCookie: accountA,
+			state:        cookieState{Cookie: "__uid=account-a; __puus=a-rotated", Seed: cookieFingerprint(accountA), Account: "account-a"},
+			wantCookie:   "__uid=account-a; __puus=a-rotated",
+			wantSource:   "state",
+		},
+		{
+			name:         "adopts rotated session when config pairs were reordered",
+			configCookie: "__puus=a; __uid=account-a",
+			state:        cookieState{Cookie: "__uid=account-a; __puus=a-rotated", Seed: cookieFingerprint(accountA), Account: "account-a"},
+			wantCookie:   "__uid=account-a; __puus=a-rotated",
+			wantSource:   "state",
+		},
+		{
+			name:         "rejects legacy state for another account",
+			configCookie: accountB,
+			state:        cookieState{Cookie: "__uid=account-a; __puus=a-rotated"},
+			wantCookie:   accountB,
+			wantSource:   "config",
+		},
+		{
+			name:         "rejects seeded state after the account was switched",
+			configCookie: accountB,
+			state:        cookieState{Cookie: "__uid=account-a; __puus=a-rotated", Seed: cookieFingerprint(accountA), Account: "account-a"},
+			wantCookie:   accountB,
+			wantSource:   "config",
+		},
+		{
+			name:         "rejects seeded state after the cookie was re-exported",
+			configCookie: "__uid=account-a; __puus=a-fresh",
+			state:        cookieState{Cookie: "__uid=account-a; __puus=a-rotated", Seed: cookieFingerprint(accountA), Account: "account-a"},
+			wantCookie:   "__uid=account-a; __puus=a-fresh",
+			wantSource:   "config",
+		},
+		{
+			name:         "keeps state when no config cookie exists",
+			configCookie: "",
+			state:        cookieState{Cookie: "__uid=account-a; __puus=a-rotated", Seed: cookieFingerprint(accountA), Account: "account-a"},
+			wantCookie:   "__uid=account-a; __puus=a-rotated",
+			wantSource:   "state",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := drive.NewFileStateStore(t.TempDir())
+			if err := store.SaveJSON("quark_cookie.json", tt.state); err != nil {
+				t.Fatal(err)
+			}
+			driver := New(tt.configCookie, Options{})
+			driver.InstallStateStore(store)
+			driver.loadCookieState()
+			if got := driver.cl.cookieValue(); got != tt.wantCookie {
+				t.Fatalf("cookie = %q, want %q", got, tt.wantCookie)
+			}
+			if got := driver.cookieSource; got != tt.wantSource {
+				t.Fatalf("cookieSource = %q, want %q", got, tt.wantSource)
+			}
+		})
+	}
+}
+
+func TestSaveUpdatedCookieBindsSeedAndAccount(t *testing.T) {
+	store := drive.NewFileStateStore(t.TempDir())
+	configCookie := "__uid=account-a; __puus=config"
+	driver := New(configCookie, Options{})
+	driver.InstallStateStore(store)
+	driver.cl.updateCookie("__puus", "rotated")
+
+	var state cookieState
+	if err := store.LoadJSON("quark_cookie.json", &state); err != nil {
+		t.Fatal(err)
+	}
+	if state.Seed != cookieFingerprint(configCookie) {
+		t.Fatalf("seed = %q, want fingerprint of the config cookie", state.Seed)
+	}
+	if state.Account != "account-a" {
+		t.Fatalf("account = %q, want account-a", state.Account)
+	}
+	if !strings.Contains(state.Cookie, "__puus=rotated") {
+		t.Fatalf("cookie = %q, want rotated __puus", state.Cookie)
+	}
+}
+
+// TestPersistedCookieStateKeepsAccountsSeparate guards the multi-account
+// invariant: two mounts of the same driver with different cookies keep their
+// own rotated session across a restart.
+func TestPersistedCookieStateKeepsAccountsSeparate(t *testing.T) {
+	configA := "__uid=account-a; __puus=a"
+	configB := "__uid=account-b; __puus=b"
+	storeA := drive.NewFileStateStore(t.TempDir())
+	storeB := drive.NewFileStateStore(t.TempDir())
+
+	firstA := New(configA, Options{})
+	firstA.InstallStateStore(storeA)
+	firstA.cl.updateCookie("__puus", "a-rotated")
+
+	firstB := New(configB, Options{})
+	firstB.InstallStateStore(storeB)
+	firstB.cl.updateCookie("__puus", "b-rotated")
+
+	reloadA := New(configA, Options{})
+	reloadA.InstallStateStore(storeA)
+	reloadA.loadCookieState()
+	reloadB := New(configB, Options{})
+	reloadB.InstallStateStore(storeB)
+	reloadB.loadCookieState()
+
+	if got := reloadA.cl.cookieValue(); got != "__uid=account-a; __puus=a-rotated" {
+		t.Fatalf("account a cookie = %q after restart, want its own rotated session", got)
+	}
+	if got := reloadB.cl.cookieValue(); got != "__uid=account-b; __puus=b-rotated" {
+		t.Fatalf("account b cookie = %q after restart, want its own rotated session", got)
+	}
+	if reloadA.cookieSource != "state" || reloadB.cookieSource != "state" {
+		t.Fatalf("cookie sources = %q/%q, want state/state", reloadA.cookieSource, reloadB.cookieSource)
+	}
+}
+
+func TestSharedCredentialSessionPropagatesRotation(t *testing.T) {
+	session := newFakeCredentialSession("main")
+	first := New("__uid=account-a; __puus=one", Options{})
+	first.InstallCredentialSession(session)
+	first.subscribeCredentialSession()
+	second := New("__uid=account-a; __puus=one", Options{})
+	second.InstallCredentialSession(session)
+	second.subscribeCredentialSession()
+
+	first.cl.updateCookie("__puus", "two")
+
+	if got := second.cl.cookieValue(); !strings.Contains(got, "__puus=two") {
+		t.Fatalf("sibling cookie = %q, want the rotated value", got)
+	}
+	if second.cookieSource != "credential" {
+		t.Fatalf("sibling source = %q, want credential", second.cookieSource)
+	}
+	snapshot := session.Snapshot()
+	if snapshot.Account != "account-a" || snapshot.Version != 1 {
+		t.Fatalf("session snapshot = %+v, want account-a at version 1", snapshot)
+	}
+	if second.cred.Version() != snapshot.Version {
+		t.Fatalf("sibling version = %d, want %d", second.cred.Version(), snapshot.Version)
+	}
+}
+
+func TestRecoverFallsBackToConfigCookie(t *testing.T) {
+	driver := New("__uid=account-a; __puus=config", Options{})
+	driver.InstallCredentialSession(newFakeCredentialSession("main"))
+	driver.cl.setCookie("__uid=account-a; __puus=stale")
+	driver.cookie = "__uid=account-a; __puus=stale"
+
+	if !driver.recoverCredential() {
+		t.Fatal("recoverCredential should fall back to the configured cookie")
+	}
+	if got := driver.cl.cookieValue(); got != "__uid=account-a; __puus=config" {
+		t.Fatalf("cookie = %q, want the configured cookie", got)
+	}
+	if driver.cookieSource != "config" {
+		t.Fatalf("source = %q, want config", driver.cookieSource)
+	}
+}
+
+func TestSharedCredentialSessionIgnoresAnotherAccount(t *testing.T) {
+	session := newFakeCredentialSession("main")
+	if _, err := session.Update(0, []byte(`{"cookie":"__uid=account-a; __puus=one"}`), "account-a"); err != nil {
+		t.Fatal(err)
+	}
+	driver := New("__uid=account-b; __puus=config", Options{})
+	driver.InstallCredentialSession(session)
+	driver.subscribeCredentialSession()
+	driver.loadCredentialSession()
+
+	if got := driver.cl.cookieValue(); got != "__uid=account-b; __puus=config" {
+		t.Fatalf("cookie = %q, want the configured account", got)
+	}
+}
+
+func TestAuthFailureAdoptsSiblingRotation(t *testing.T) {
+	session := newFakeCredentialSession("main")
+	if _, err := session.Update(0, []byte(`{"cookie":"__uid=account-a; __puus=rotated"}`), "account-a"); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var cookies []string
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		cookies = append(cookies, r.Header.Get("Cookie"))
+		attempt := len(cookies)
+		mu.Unlock()
+		if attempt == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		writeJSON(t, w, map[string]any{"status": 200, "code": 0, "data": map[string]any{"list": []any{}}})
+	}))
+	defer api.Close()
+
+	driver := New("__uid=account-a; __puus=stale", Options{BaseURL: api.URL, V2URL: api.URL})
+	driver.InstallCredentialSession(session)
+
+	var resp sortResp
+	if err := driver.cl.request(context.Background(), http.MethodGet, "/file/sort", map[string]string{"pdir_fid": "0"}, nil, &resp); err != nil {
+		t.Fatalf("request after sibling rotation = %v, want success", err)
+	}
+	if len(cookies) != 2 {
+		t.Fatalf("attempts = %d, want 2 (stale + adopted)", len(cookies))
+	}
+	if !strings.Contains(cookies[1], "__puus=rotated") {
+		t.Fatalf("retry cookie = %q, want the adopted rotation", cookies[1])
+	}
+}
+
+func TestAuthFailureWithoutNewerSessionSurfaces(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer api.Close()
+	driver := New("__uid=account-a; __puus=stale", Options{BaseURL: api.URL, V2URL: api.URL})
+	driver.InstallCredentialSession(newFakeCredentialSession("main"))
+
+	var resp sortResp
+	err := driver.cl.request(context.Background(), http.MethodGet, "/file/sort", map[string]string{"pdir_fid": "0"}, nil, &resp)
+	if err == nil {
+		t.Fatal("request without a newer session should surface the auth failure")
+	}
+}
+
+type fakeCredentialSession struct {
+	name    string
+	mu      sync.Mutex
+	payload []byte
+	version uint64
+	account string
+	subs    []func(drive.CredentialSnapshot)
+}
+
+func newFakeCredentialSession(name string) *fakeCredentialSession {
+	return &fakeCredentialSession{name: name}
+}
+
+func (s *fakeCredentialSession) Name() string { return s.name }
+
+func (s *fakeCredentialSession) Snapshot() drive.CredentialSnapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return drive.CredentialSnapshot{
+		Payload: append([]byte(nil), s.payload...),
+		Version: s.version,
+		Account: s.account,
+	}
+}
+
+func (s *fakeCredentialSession) Update(expected uint64, payload []byte, account string) (drive.CredentialSnapshot, error) {
+	s.mu.Lock()
+	if expected != s.version {
+		snapshot := drive.CredentialSnapshot{Payload: append([]byte(nil), s.payload...), Version: s.version, Account: s.account}
+		s.mu.Unlock()
+		return snapshot, drive.ErrCredentialVersionConflict
+	}
+	s.payload = append([]byte(nil), payload...)
+	s.account = account
+	s.version++
+	snapshot := drive.CredentialSnapshot{Payload: append([]byte(nil), s.payload...), Version: s.version, Account: s.account}
+	subs := append([]func(drive.CredentialSnapshot){}, s.subs...)
+	s.mu.Unlock()
+	for _, fn := range subs {
+		fn(snapshot)
+	}
+	return snapshot, nil
+}
+
+func (s *fakeCredentialSession) Subscribe(fn func(drive.CredentialSnapshot)) func() {
+	s.mu.Lock()
+	s.subs = append(s.subs, fn)
+	s.mu.Unlock()
+	return func() {}
+}
+
+func (s *fakeCredentialSession) Refresh(context.Context, func(drive.CredentialSnapshot) ([]byte, string, error)) (drive.CredentialSnapshot, error) {
+	return drive.CredentialSnapshot{}, errors.New("refresh unsupported")
 }
 
 func TestOSSClientHasNoWholeRequestTimeout(t *testing.T) {
@@ -754,8 +1531,8 @@ func TestDriverPutMultipartUpload(t *testing.T) {
 	content := []byte("abcdefgh")
 	contentMD5 := md5.Sum(content)
 	contentSHA1 := sha1.Sum(content)
-	wantMD5 := fmt.Sprintf("%X", contentMD5[:])
-	wantSHA1 := fmt.Sprintf("%X", contentSHA1[:])
+	wantMD5 := fmt.Sprintf("%x", contentMD5[:])
+	wantSHA1 := fmt.Sprintf("%x", contentSHA1[:])
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/file/upload/pre":
@@ -1063,8 +1840,8 @@ func TestDriverPutSourceUnderCryptHashesEncryptedSource(t *testing.T) {
 	plain := []byte("plain payload")
 	plainMD5 := md5.Sum(plain)
 	plainSHA1 := sha1.Sum(plain)
-	plainMD5Hex := fmt.Sprintf("%X", plainMD5[:])
-	plainSHA1Hex := fmt.Sprintf("%X", plainSHA1[:])
+	plainMD5Hex := fmt.Sprintf("%x", plainMD5[:])
+	plainSHA1Hex := fmt.Sprintf("%x", plainSHA1[:])
 	var hashCalled bool
 	var hashBody map[string]any
 	var finishCalled bool
@@ -1147,8 +1924,8 @@ func TestDriverPutSourceUnderCryptHashesEncryptedSource(t *testing.T) {
 	}
 	cipherMD5 := md5.Sum(uploadedCipher)
 	cipherSHA1 := sha1.Sum(uploadedCipher)
-	wantMD5 := fmt.Sprintf("%X", cipherMD5[:])
-	wantSHA1 := fmt.Sprintf("%X", cipherSHA1[:])
+	wantMD5 := fmt.Sprintf("%x", cipherMD5[:])
+	wantSHA1 := fmt.Sprintf("%x", cipherSHA1[:])
 	if hashBody["md5"] != wantMD5 || hashBody["sha1"] != wantSHA1 {
 		t.Fatalf("unexpected encrypted hash body: %+v, want md5=%s sha1=%s", hashBody, wantMD5, wantSHA1)
 	}
@@ -1179,8 +1956,8 @@ func TestDriverPutSourceUnderContentDedupCryptInstantUploadsByEncryptedHash(t *t
 	encrypted := encryptForTest(t, cp, plain)
 	encryptedMD5 := md5.Sum(encrypted)
 	encryptedSHA1 := sha1.Sum(encrypted)
-	wantMD5 := fmt.Sprintf("%X", encryptedMD5[:])
-	wantSHA1 := fmt.Sprintf("%X", encryptedSHA1[:])
+	wantMD5 := fmt.Sprintf("%x", encryptedMD5[:])
+	wantSHA1 := fmt.Sprintf("%x", encryptedSHA1[:])
 	var hashCalled bool
 	var finishCalled bool
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1439,9 +2216,10 @@ func TestDriverPutSourceStreamsMultipartWithoutPartSizedReads(t *testing.T) {
 
 func TestDriverUploadPartUsesNativeBandwidthLimiter(t *testing.T) {
 	// The handlers run on httptest's own goroutines and must never call
-	// t.Fatal/t.Fatalf: when the client's deadline fires mid-request it aborts
-	// the connection, the handler's response write fails, and a test-fatal
-	// call from that goroutine fails the whole test (observed on GH runners).
+	// t.Fatal/t.Fatalf: when the client's cancellation fires mid-request it
+	// aborts the connection, the handler's response write fails, and a
+	// test-fatal call from that goroutine fails the whole test (observed on GH
+	// runners).
 	oss := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
 		w.Header().Set("Etag", "etag-1")
@@ -1449,7 +2227,14 @@ func TestDriverUploadPartUsesNativeBandwidthLimiter(t *testing.T) {
 	}))
 	defer oss.Close()
 
+	authServed := make(chan struct{}, 1)
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/file/upload/auth" {
+			select {
+			case authServed <- struct{}{}:
+			default:
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"status":200,"code":0,"data":{"auth_key":"auth-key"}}`))
 	}))
@@ -1458,21 +2243,10 @@ func TestDriverUploadPartUsesNativeBandwidthLimiter(t *testing.T) {
 	driver := New("k=v", Options{BaseURL: api.URL, V2URL: api.URL})
 	routeOSSToTestServer(driver.cl.ossClient, oss)
 	driver.InstallBandwidthLimiter(drive.NewBandwidthLimiter(drive.BandwidthLimits{UploadBytesPerSecond: 1}))
-	// The body must be large enough that throttling it at 1 byte/s needs hours:
-	// then the deadline always fires inside the throttled body read, no matter
-	// how slow the local auth/TLS round trip gets on a loaded CI runner. With a
-	// tiny body the outcome can race the wall clock (observed once on a GH
-	// ubuntu runner), so the deadline is a determinism aid, not the assert. It
-	// is set well above the auth round trip so only the throttled read can hit
-	// it; a success would mean the native limiter was bypassed.
-	//
-	// 64KiB at 1B/s is 18 hours, so the deadline only has to clear the auth
-	// round trip - 500ms leaves it a wider margin than the read can ever cross,
-	// and halves what the test spends waiting for the throttle to prove itself.
-	body := strings.Repeat("s", 64*1024)
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
 
+	// 64KiB at 1 B/s needs 18 hours: a part upload that finishes while the
+	// limiter is armed can only mean the native limiter was bypassed.
+	body := strings.Repeat("s", 64*1024)
 	pre := &upPreResp{}
 	pre.Data.TaskID = "task-1"
 	pre.Data.UploadID = "upload-1"
@@ -1481,11 +2255,45 @@ func TestDriverUploadPartUsesNativeBandwidthLimiter(t *testing.T) {
 	pre.Data.Bucket = "bucket"
 	pre.Data.AuthInfo = "auth-info"
 
-	_, err := driver.uploadPart(ctx, pre, 1, int64(len(body)), func() (io.Reader, error) {
-		return strings.NewReader(body), nil
-	})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("uploadPart error = %v, want context deadline exceeded", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := driver.uploadPart(ctx, pre, 1, int64(len(body)), func() (io.Reader, error) {
+			return strings.NewReader(body), nil
+		})
+		done <- err
+	}()
+
+	// Measure the throttle rather than the error a deadline produces: whether
+	// a canceled PUT surfaces as a deadline error or as the test server's 200
+	// is a client/transport race (observed once on a GH ubuntu runner), and
+	// reading that 200 as "the part uploaded" is exactly what would make this
+	// test flaky. Wait for the auth round trip so the PUT is certainly in
+	// flight, then require that the throttled body keeps the call busy.
+	select {
+	case <-authServed:
+	case err := <-done:
+		t.Fatalf("uploadPart returned %v before the part PUT started", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("uploadPart never reached the part PUT")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("uploadPart returned %v; a 1 B/s limiter cannot move 64KiB", err)
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	// Cancelling must abort the throttled read promptly instead of leaving the
+	// part hanging on the limiter.
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("uploadPart error = %v, want context canceled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("uploadPart did not stop after cancel")
 	}
 }
 
@@ -1941,7 +2749,7 @@ func TestPutSourceHandlelessBindingIsDiscarded(t *testing.T) {
 		ParentID:    "parent",
 		Name:        "resume.bin",
 		Size:        int64(len(content)),
-		Fingerprint: strings.ToLower(fmt.Sprintf("%X", md5Sum)) + strings.ToLower(fmt.Sprintf("%X", sha1Sum)),
+		Fingerprint: strings.ToLower(fmt.Sprintf("%x", md5Sum)) + strings.ToLower(fmt.Sprintf("%x", sha1Sum)),
 	}.Key()
 	if err := d.sessions.Create(key, json.RawMessage(`{}`)); err != nil {
 		t.Fatal(err)

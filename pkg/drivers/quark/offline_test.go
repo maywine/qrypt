@@ -33,6 +33,7 @@ type offlineTestServer struct {
 	// /file/sort per parent fid; resultList overrides the /task result list.
 	queued     bool
 	notInstant bool
+	omitFid    bool
 	sortTree   map[string][]map[string]any
 	sortFail   map[string]bool
 	sortCode   map[string]int
@@ -68,7 +69,10 @@ func (s *offlineTestServer) handler() http.Handler {
 			if dirFid == "" {
 				dirFid = "dir-1"
 			}
-			data := map[string]any{"task_id": s.taskID, "fid": rootFid, "dir_fid": dirFid}
+			data := map[string]any{"task_id": s.taskID, "dir_fid": dirFid}
+			if !s.omitFid {
+				data["fid"] = rootFid
+			}
 			if s.session != "" {
 				data["speedup_dl_info"] = map[string]any{"speedup_session": s.session}
 			}
@@ -531,5 +535,205 @@ func TestOfflineDownloadNoAvailabilityWhenNotInstant(t *testing.T) {
 	}
 	if obs.Available {
 		t.Fatal("a running non-instant task should not report availability")
+	}
+}
+
+// TestOfflineDownloadUsesDirFidAsRootWhenSubmitOmitsFid reproduces the real
+// Quark instant-cached shape: submit has no fid and dir_fid is the resource
+// folder, while the completed result list reports only one of its files.
+func TestOfflineDownloadUsesDirFidAsRootWhenSubmitOmitsFid(t *testing.T) {
+	t.Parallel()
+
+	fake := &offlineTestServer{
+		t: t, taskID: "task-dirfid", omitFid: true, submitDirFid: "resource-fid",
+		sortTree: map[string][]map[string]any{
+			"parse-fid": {{"fid": "resource-fid", "file_name": "Sintel", "dir": true}},
+			"resource-fid": {
+				{"fid": "fid-mp4", "file_name": "Sintel.mp4", "size": 1000, "file": true},
+				{"fid": "fid-poster", "file_name": "poster.jpg", "size": 50, "file": true},
+			},
+		},
+		resultList: []map[string]any{{"fid": "fid-mp4", "file_name": "Sintel.mp4", "size": 1000}},
+	}
+	server := httptest.NewServer(fake.handler())
+	defer server.Close()
+	driver := New("k=v", Options{BaseURL: server.URL, V2URL: server.URL})
+
+	created, err := driver.CreateOfflineDownload(context.Background(), drive.OfflineDownloadRequest{
+		SourceKind:    drive.OfflineSourceMagnet,
+		Source:        "magnet:?xt=urn:btih:abcdef",
+		Destination:   "/",
+		DestinationID: "parse-fid",
+	})
+	if err != nil {
+		t.Fatalf("CreateOfflineDownload: %v", err)
+	}
+	if created.RemoteID != "resource-fid" {
+		t.Fatalf("root id = %q, want the dir_fid resource folder", created.RemoteID)
+	}
+	if created.Destination != "parse-fid" {
+		t.Fatalf("parent id = %q, want the parse destination", created.Destination)
+	}
+	if !created.Available || len(created.Files) != 2 {
+		t.Fatalf("created = available %v files %d, want available with both staged files", created.Available, len(created.Files))
+	}
+	paths := map[string]string{}
+	for _, file := range created.Files {
+		paths[file.RemoteID] = file.Path
+	}
+	if paths["fid-mp4"] != "Sintel/Sintel.mp4" || paths["fid-poster"] != "Sintel/poster.jpg" {
+		t.Fatalf("staged paths = %+v, want the resource-folder prefixes", paths)
+	}
+}
+
+// TestOfflineDownloadDiscoversSingleFileWhenSubmitOmitsFid covers the
+// single-file shape: submit returns no fid and dir_fid is the parse directory,
+// so the produced file is discovered below it.
+func TestOfflineDownloadDiscoversSingleFileWhenSubmitOmitsFid(t *testing.T) {
+	t.Parallel()
+
+	fake := &offlineTestServer{
+		t: t, taskID: "task-single-dirfid", omitFid: true, submitDirFid: "parse-fid",
+		sortTree: map[string][]map[string]any{
+			"parse-fid": {{"fid": "fid-single", "file_name": "single.mkv", "size": 7, "file": true}},
+		},
+		resultList: []map[string]any{{"fid": "fid-single", "file_name": "single.mkv", "size": 7}},
+	}
+	server := httptest.NewServer(fake.handler())
+	defer server.Close()
+	driver := New("k=v", Options{BaseURL: server.URL, V2URL: server.URL})
+
+	if _, err := driver.CreateOfflineDownload(context.Background(), drive.OfflineDownloadRequest{
+		SourceKind: drive.OfflineSourceMagnet, Source: "magnet:?xt=urn:btih:single",
+		Destination: "/", DestinationID: "parse-fid",
+	}); err != nil {
+		t.Fatalf("CreateOfflineDownload: %v", err)
+	}
+	obs, err := driver.GetOfflineDownload(context.Background(), "task-single-dirfid")
+	if err != nil {
+		t.Fatalf("GetOfflineDownload: %v", err)
+	}
+	if !obs.Available || len(obs.Files) != 1 || obs.Files[0].Path != "single.mkv" {
+		t.Fatalf("observation = available %v files %+v, want single.mkv", obs.Available, obs.Files)
+	}
+}
+
+// offlineDiscoveryDriver returns a driver whose parse destination "parse-fid"
+// lists tree and whose task result list is results.
+func offlineDiscoveryDriver(t *testing.T, taskID string, tree map[string][]map[string]any, results []map[string]any) *Driver {
+	t.Helper()
+	fake := &offlineTestServer{
+		t: t, taskID: taskID, omitFid: true, submitDirFid: "parse-fid",
+		sortTree: tree, resultList: results,
+	}
+	server := httptest.NewServer(fake.handler())
+	t.Cleanup(server.Close)
+	return New("k=v", Options{BaseURL: server.URL, V2URL: server.URL})
+}
+
+func observeOffline(t *testing.T, driver *Driver, taskID string) drive.OfflineDownload {
+	t.Helper()
+	if _, err := driver.CreateOfflineDownload(context.Background(), drive.OfflineDownloadRequest{
+		SourceKind: drive.OfflineSourceMagnet, Source: "magnet:?xt=urn:btih:" + taskID,
+		Destination: "/", DestinationID: "parse-fid",
+	}); err != nil {
+		t.Fatalf("CreateOfflineDownload: %v", err)
+	}
+	obs, err := driver.GetOfflineDownload(context.Background(), taskID)
+	if err != nil {
+		t.Fatalf("GetOfflineDownload: %v", err)
+	}
+	return obs
+}
+
+// TestOfflineDownloadIgnoresSameNameStaleFolder: the parse destination can hold
+// an older task's output with the same name and size. A result file that
+// carries a provider ID must bind to that ID, never to the look-alike: the
+// post-download cleanup deletes everything under the discovered root.
+func TestOfflineDownloadIgnoresSameNameStaleFolder(t *testing.T) {
+	t.Parallel()
+
+	driver := offlineDiscoveryDriver(t, "task-stale", map[string][]map[string]any{
+		"parse-fid": {
+			{"fid": "stale-folder", "file_name": "Sintel", "file": false},
+			{"fid": "fresh-folder", "file_name": "Sintel (1)", "file": false},
+		},
+		"stale-folder": {{"fid": "stale-mp4", "file_name": "Sintel.mp4", "size": 1000, "file": true}},
+		"fresh-folder": {{"fid": "fresh-mp4", "file_name": "Sintel.mp4", "size": 1000, "file": true}},
+	}, []map[string]any{{"fid": "fresh-mp4", "file_name": "Sintel.mp4", "size": 1000}})
+
+	obs := observeOffline(t, driver, "task-stale")
+	if !obs.Available {
+		t.Fatalf("observation = %+v, want the fresh root resolved", obs)
+	}
+	paths := map[string]string{}
+	for _, file := range obs.Files {
+		paths[file.RemoteID] = file.Path
+	}
+	if _, ok := paths["stale-mp4"]; ok {
+		t.Fatalf("stale file was published as this task's output: %+v", obs.Files)
+	}
+	// Quark strips the " (1)" conflict suffix from listed names, so both
+	// folders are visible as "Sintel": only the provider ID tells them apart.
+	if got := paths["fresh-mp4"]; got != "Sintel/Sintel.mp4" {
+		t.Fatalf("fresh path = %q, want Sintel/Sintel.mp4", got)
+	}
+}
+
+// TestOfflineDownloadDiscoversRootByNameWithoutProviderID keeps the name/size
+// fallback for result files the provider gave no ID.
+func TestOfflineDownloadDiscoversRootByNameWithoutProviderID(t *testing.T) {
+	t.Parallel()
+
+	driver := offlineDiscoveryDriver(t, "task-noid", map[string][]map[string]any{
+		"parse-fid": {{"fid": "fid-single", "file_name": "single.mkv", "size": 7, "file": true}},
+	}, []map[string]any{{"file_name": "single.mkv", "size": 7}})
+
+	obs := observeOffline(t, driver, "task-noid")
+	if !obs.Available || len(obs.Files) != 1 {
+		t.Fatalf("observation = available %v files %+v, want one resolved file", obs.Available, obs.Files)
+	}
+	if obs.Files[0].RemoteID != "fid-single" || obs.Files[0].Path != "single.mkv" {
+		t.Fatalf("resolved file = %+v, want fid-single at single.mkv", obs.Files[0])
+	}
+}
+
+// TestOfflineDownloadDefersAmbiguousNameMatch: without provider IDs and without
+// anything to separate two identical candidates, discovery must report the
+// result set as unavailable instead of picking one to download and delete.
+func TestOfflineDownloadDefersAmbiguousNameMatch(t *testing.T) {
+	t.Parallel()
+
+	driver := offlineDiscoveryDriver(t, "task-ambiguous", map[string][]map[string]any{
+		"parse-fid": {
+			{"fid": "copy-a", "file_name": "movie.mkv", "size": 7, "file": true},
+			{"fid": "copy-b", "file_name": "movie.mkv", "size": 7, "file": true},
+		},
+	}, []map[string]any{{"file_name": "movie.mkv", "size": 7}})
+
+	obs := observeOffline(t, driver, "task-ambiguous")
+	if obs.Available {
+		t.Fatalf("observation = %+v, want the ambiguous root left unavailable", obs)
+	}
+}
+
+// TestOfflineDownloadPrefersNewestNameMatch: when only names are available, the
+// newest candidate is the task's own output; the older look-alike is not it.
+func TestOfflineDownloadPrefersNewestNameMatch(t *testing.T) {
+	t.Parallel()
+
+	driver := offlineDiscoveryDriver(t, "task-newest", map[string][]map[string]any{
+		"parse-fid": {
+			{"fid": "old-copy", "file_name": "movie.mkv", "size": 7, "file": true, "updated_at": 1000},
+			{"fid": "new-copy", "file_name": "movie.mkv", "size": 7, "file": true, "updated_at": 5000},
+		},
+	}, []map[string]any{{"file_name": "movie.mkv", "size": 7}})
+
+	obs := observeOffline(t, driver, "task-newest")
+	if !obs.Available || len(obs.Files) != 1 {
+		t.Fatalf("observation = available %v files %+v, want one resolved file", obs.Available, obs.Files)
+	}
+	if obs.Files[0].RemoteID != "new-copy" {
+		t.Fatalf("resolved file = %+v, want the newest candidate new-copy", obs.Files[0])
 	}
 }

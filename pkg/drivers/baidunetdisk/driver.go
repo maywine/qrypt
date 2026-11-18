@@ -18,6 +18,7 @@ import (
 	"github.com/yinzhenyu/qrypt/pkg/drive/session"
 	"github.com/yinzhenyu/qrypt/pkg/drivers/internal/driverutil"
 	"github.com/yinzhenyu/qrypt/pkg/drivers/internal/driverutil/httpclient"
+	"github.com/yinzhenyu/qrypt/pkg/logging"
 )
 
 const (
@@ -40,6 +41,7 @@ type Driver struct {
 	httpClient         *http.Client
 	refreshToken       string
 	accessToken        string
+	account            string
 	configRefreshToken string
 	clientID           string
 	clientSecret       string
@@ -54,6 +56,10 @@ type Driver struct {
 	downloadUA         string
 	limiter            *drive.BandwidthLimiter
 	stateStore         drive.StateStore
+	// cred owns the shared-session lifecycle for mounts that reference a
+	// [[credentials]] entry; a nil session keeps the legacy per-mount token
+	// state.
+	cred               *driverutil.CredentialBinding[credentialPayload]
 	tokenSource        string
 	tokenUpdated       time.Time
 	tokenMu            sync.Mutex
@@ -98,6 +104,7 @@ type tokenState struct {
 	AccessToken  string    `json:"access_token,omitempty"`
 	RefreshToken string    `json:"refresh_token,omitempty"`
 	ExpiresAt    time.Time `json:"expires_at,omitempty"`
+	Account      string    `json:"account,omitempty"`
 	// ConfigRefreshToken records the config refresh token that produced this
 	// state, so a rotated pair (state newer than config) can be distinguished
 	// from a user-swapped config token (config newer than state).
@@ -174,7 +181,7 @@ func New(opts Options) *Driver {
 	if downloadUA == "" {
 		downloadUA = defaultDownloadUA
 	}
-	return &Driver{
+	d := &Driver{
 		httpClient:         &http.Client{Timeout: 60 * time.Second},
 		refreshToken:       opts.RefreshToken,
 		accessToken:        opts.AccessToken,
@@ -193,13 +200,20 @@ func New(opts Options) *Driver {
 		tokenSource:        "config",
 		metrics:            driverutil.NewBuffer(500),
 	}
+	d.cred = driverutil.NewCredentialBinding("baidu_netdisk", decodeCredentialPayload, d.applyCredentialBinding)
+	return d
 }
 
 func (d *Driver) Init(ctx context.Context) error {
 	if d.refreshToken == "" {
 		return fmt.Errorf("baidu_netdisk: refresh_token is required")
 	}
-	d.loadTokenState()
+	if d.cred.Session() != nil {
+		d.loadCredentialSession()
+		d.subscribeCredentialSession()
+	} else {
+		d.loadTokenState()
+	}
 	if !d.useOnlineAPI && (d.clientID == "" || d.clientSecret == "") {
 		return fmt.Errorf("baidu_netdisk: client_id and client_secret are required when use_online_api=false")
 	}
@@ -209,6 +223,7 @@ func (d *Driver) Init(ctx context.Context) error {
 			return err
 		}
 	}
+	d.loadAccount(ctx)
 	if d.rootPath != "/" {
 		if _, err := d.statRoot(ctx); err != nil {
 			d.setLastError(err)
@@ -219,6 +234,7 @@ func (d *Driver) Init(ctx context.Context) error {
 }
 
 func (d *Driver) Drop(ctx context.Context) error {
+	d.cred.Close()
 	d.sessionStoreMu.Lock()
 	if d.sessionCancel != nil {
 		d.sessionCancel()
@@ -234,6 +250,12 @@ func (d *Driver) Drop(ctx context.Context) error {
 func (d *Driver) InstallStateStore(store drive.StateStore) {
 	d.stateStore = store
 	d.installSessionIndex(store)
+}
+
+// InstallCredentialSession lets every mount of one configured Baidu credential
+// share one token pair and coalesce refreshes.
+func (d *Driver) InstallCredentialSession(session drive.CredentialSession) {
+	d.cred.Install(session)
 }
 
 func (d *Driver) InstallBandwidthLimiter(limiter *drive.BandwidthLimiter) drive.BandwidthLimitDirection {
@@ -254,6 +276,13 @@ func (d *Driver) DebugSnapshot(ctx context.Context) (drive.DebugSnapshot, error)
 	if lastError != "" {
 		health = "degraded"
 	}
+	extra := map[string]any{
+		drive.DebugExtraCredentialSource:   d.tokenSource,
+		drive.DebugExtraCredentialUpdated:  d.tokenUpdated,
+		drive.DebugExtraLastError:          lastError,
+		drive.DebugExtraInstantUploadCount: instantUploadCount,
+	}
+	d.cred.Debug(extra)
 	return drive.DebugSnapshot{
 		Driver:      "baidu_netdisk",
 		Health:      health,
@@ -265,12 +294,7 @@ func (d *Driver) DebugSnapshot(ctx context.Context) (drive.DebugSnapshot, error)
 			"use_online_api":        d.useOnlineAPI,
 			"upload_api":            d.uploadAPI,
 		},
-		Extra: map[string]any{
-			drive.DebugExtraCredentialSource:   d.tokenSource,
-			drive.DebugExtraCredentialUpdated:  d.tokenUpdated,
-			drive.DebugExtraLastError:          lastError,
-			drive.DebugExtraInstantUploadCount: instantUploadCount,
-		},
+		Extra: extra,
 	}, nil
 }
 
@@ -334,6 +358,13 @@ func (d *Driver) ensureToken(ctx context.Context) error {
 }
 
 func (d *Driver) refresh(ctx context.Context) error {
+	if d.cred.Session() != nil {
+		return d.refreshShared(ctx)
+	}
+	return d.refreshDirect(ctx)
+}
+
+func (d *Driver) refreshDirect(ctx context.Context) error {
 	d.tokenMu.Lock()
 	defer d.tokenMu.Unlock()
 	if d.refreshToken == "" {
@@ -387,10 +418,109 @@ func (d *Driver) refresh(ctx context.Context) error {
 	}
 	d.tokenSource = "refresh"
 	d.tokenUpdated = time.Now()
+	if d.cred.Session() != nil {
+		return nil
+	}
 	if err := d.saveTokenState(); err != nil {
 		return fmt.Errorf("baidu_netdisk: save token state: %w", err)
 	}
 	return nil
+}
+
+// refreshShared coalesces refreshes across every mount sharing the credential.
+// The session's refresh token is authoritative so a rotated chain is not lost.
+func (d *Driver) refreshShared(ctx context.Context) error {
+	_, err := d.cred.Refresh(ctx, func(value credentialPayload, current drive.CredentialSnapshot) ([]byte, string, error) {
+		if value.RefreshToken != "" {
+			d.refreshToken = value.RefreshToken
+		}
+		if value.AccessToken != "" {
+			d.accessToken = value.AccessToken
+			d.tokenExpires = value.ExpiresAt
+		}
+		if d.accessToken != "" && !d.tokenExpires.IsZero() && time.Now().Before(d.tokenExpires.Add(-defaultTokenSkew)) {
+			return current.Payload, d.account, nil
+		}
+		if refreshErr := d.refreshDirect(ctx); refreshErr != nil {
+			return nil, "", refreshErr
+		}
+		encoded, _, encodeErr := encodeCredentialPayload(credentialPayload{
+			AccessToken:  d.accessToken,
+			RefreshToken: d.refreshToken,
+			ExpiresAt:    d.tokenExpires,
+		})
+		return encoded, d.account, encodeErr
+	})
+	return err
+}
+
+// loadCredentialSession adopts the shared session's token pair and account.
+func (d *Driver) loadCredentialSession() {
+	d.cred.Load()
+}
+
+// subscribeCredentialSession follows rotations committed by sibling mounts.
+func (d *Driver) subscribeCredentialSession() {
+	d.cred.Subscribe()
+}
+
+// applyCredentialBinding applies one decoded payload to the client.
+func (d *Driver) applyCredentialBinding(value credentialPayload, snapshot drive.CredentialSnapshot, source string) bool {
+	if value.AccessToken == "" && value.RefreshToken == "" {
+		return false
+	}
+	d.accessToken = value.AccessToken
+	d.refreshToken = value.RefreshToken
+	d.tokenExpires = value.ExpiresAt
+	d.tokenSource = source
+	d.tokenUpdated = snapshot.UpdatedAt
+	if snapshot.Account != "" {
+		d.account = snapshot.Account
+	}
+	return true
+}
+
+type credentialPayload struct {
+	AccessToken  string    `json:"access_token,omitempty"`
+	RefreshToken string    `json:"refresh_token,omitempty"`
+	ExpiresAt    time.Time `json:"expires_at,omitempty"`
+}
+
+func encodeCredentialPayload(payload credentialPayload) ([]byte, string, error) {
+	data, err := json.Marshal(payload)
+	return data, "", err
+}
+
+func decodeCredentialPayload(data []byte) (credentialPayload, error) {
+	var payload credentialPayload
+	if len(data) == 0 {
+		return payload, nil
+	}
+	err := json.Unmarshal(data, &payload)
+	return payload, err
+}
+
+// loadAccount records a human-readable account name for diagnostics. It is
+// best-effort: a provider or online-api hiccup must not fail the mount.
+func (d *Driver) loadAccount(ctx context.Context) {
+	var resp struct {
+		Errno       int    `json:"errno"`
+		BaiduName   string `json:"baidu_name"`
+		NetdiskName string `json:"netdisk_name"`
+		UK          int64  `json:"uk"`
+	}
+	if err := d.request(ctx, http.MethodGet, d.apiBaseURL+"/xpan/nas", map[string]string{"method": "uinfo"}, nil, &resp); err != nil {
+		logging.L.Warnf("[baidu_netdisk] fetch account: %v", err)
+		return
+	}
+	switch {
+	case resp.NetdiskName != "":
+		d.account = resp.NetdiskName
+	case resp.BaiduName != "":
+		d.account = resp.BaiduName
+	case resp.UK != 0:
+		d.account = strconv.FormatInt(resp.UK, 10)
+	}
 }
 
 func (d *Driver) loadTokenState() {
@@ -420,6 +550,9 @@ func (d *Driver) loadTokenState() {
 		d.tokenExpires = state.ExpiresAt
 	}
 	d.tokenUpdated = state.UpdatedAt
+	if state.Account != "" {
+		d.account = state.Account
+	}
 }
 
 func (d *Driver) saveTokenState() error {
@@ -430,6 +563,7 @@ func (d *Driver) saveTokenState() error {
 		AccessToken:        d.accessToken,
 		RefreshToken:       d.refreshToken,
 		ExpiresAt:          d.tokenExpires,
+		Account:            d.account,
 		ConfigRefreshToken: d.configRefreshToken,
 		UpdatedAt:          d.tokenUpdated,
 	})

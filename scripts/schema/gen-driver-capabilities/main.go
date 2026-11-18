@@ -17,6 +17,7 @@ import (
 type driverCapabilities struct {
 	Capabilities []string `json:"capabilities"`
 	RemoteHash   bool     `json:"remote_hash"`
+	Login        bool     `json:"login"`
 }
 
 type driverSpec struct {
@@ -63,6 +64,11 @@ var drivers = []driverSpec{
 		"access_key_id":     "access",
 		"secret_access_key": "secret",
 	}},
+	{Name: "drime", Params: drive.Params{"access_token": "token"}},
+	{Name: "koofr", Params: drive.Params{
+		"email":        "user@example.com",
+		"app_password": "app-password",
+	}},
 }
 
 func main() {
@@ -80,7 +86,12 @@ func main() {
 			names[i] = string(capability)
 		}
 		_, remoteHash := drv.(drive.RemoteHasher)
-		out[spec.Name] = driverCapabilities{Capabilities: names, RemoteHash: remoteHash}
+		_, login := drive.LoginProviderFor(spec.Name)
+		out[spec.Name] = driverCapabilities{
+			Capabilities: names,
+			RemoteHash:   remoteHash,
+			Login:        login,
+		}
 	}
 
 	encoder := json.NewEncoder(os.Stdout)

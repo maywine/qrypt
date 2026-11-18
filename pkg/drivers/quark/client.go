@@ -35,22 +35,47 @@ const (
 	partUploadWorkers      = 1
 )
 
+// retrySleep pauses between transient request failures. Tests replace it to
+// collapse the backoff so a simulated provider outage does not cost seconds of
+// wall clock; the retry loop and its attempt counting stay exercised.
+var retrySleep = func(attempt int) { time.Sleep(util.ExponentialBackoff(attempt)) }
+
 type client struct {
-	httpClient      *http.Client
+	httpClient *http.Client
+	// downloadClient is swapped when a download connection goes bad; reads go
+	// through downloadHTTP so a degraded edge does not stick to every later
+	// Range request.
 	downloadClient  *http.Client
-	ossClient       *http.Client
-	cookie          string
-	baseURL         string
-	downloadBaseURL string
-	v2URL           string
-	mu              sync.RWMutex
-	sem             chan struct{}
-	mgmtSem         chan struct{}
-	metaSem         chan struct{}
-	ossSem          chan struct{}
-	onCookieUpdate  func(cookie string)
-	metrics         *driverutil.Buffer
-	wgKeys          map[int]string
+	downloadMu      sync.RWMutex
+	downloadDirty   bool
+	downloadReason  string
+	downloadRotated time.Time
+	// downloadRotations and downloadLastReason are diagnostic counters for
+	// tests and /v1/driver: they show whether a failure actually swapped the
+	// connection pool instead of only being throttled.
+	downloadRotations  int
+	downloadLastReason string
+	ossClient          *http.Client
+	cookie             string
+	baseURL            string
+	downloadBaseURL    string
+	v2URL              string
+	mu                 sync.RWMutex
+	sem                chan struct{}
+	mgmtSem            chan struct{}
+	metaSem            chan struct{}
+	ossSem             chan struct{}
+	onCookieUpdate     func(cookie string)
+	// onAuthRetry reloads a newer shared credential after a 401 and reports
+	// whether the request should be retried once.
+	onAuthRetry func() bool
+	metrics     *driverutil.Buffer
+	// wgKeys overrides the built-in wg data-key table for offline request
+	// encryption (secureNo → 16-byte hex key).
+	wgKeys map[int]string
+	// edges tracks recently failed CDN edge addresses so download dials can
+	// avoid them.
+	edges *edgeHealth
 }
 
 func newClient(cookie string, opts clientOptions) *client {
@@ -66,9 +91,8 @@ func newClient(cookie string, opts clientOptions) *client {
 	if v2URL == "" {
 		v2URL = defaultV2URL
 	}
-	return &client{
+	c := &client{
 		httpClient:      newHTTPClient(30 * time.Second),
-		downloadClient:  newHTTPClient(0),
 		ossClient:       newOSSClient(),
 		cookie:          cookie,
 		baseURL:         baseURL,
@@ -81,6 +105,9 @@ func newClient(cookie string, opts clientOptions) *client {
 		metrics:         driverutil.NewBuffer(500),
 		wgKeys:          opts.WGKeys,
 	}
+	c.edges = newEdgeHealth(edgePenaltyTTL)
+	c.downloadClient = c.newDownloadHTTPClient()
+	return c
 }
 
 type clientOptions struct {
@@ -91,16 +118,35 @@ type clientOptions struct {
 
 func newHTTPClient(timeout time.Duration) *http.Client {
 	client := httputil.NewClient(timeout, 30*time.Second)
-	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		if err := validateDownloadURL(req.URL); err != nil {
-			return err
-		}
-		if len(via) >= 10 {
-			return fmt.Errorf("quark: too many redirects")
-		}
-		return nil
-	}
+	client.CheckRedirect = checkDownloadRedirect
 	return client
+}
+
+func checkDownloadRedirect(req *http.Request, via []*http.Request) error {
+	if err := validateDownloadURL(req.URL); err != nil {
+		return err
+	}
+	if len(via) >= 10 {
+		return fmt.Errorf("quark: too many redirects")
+	}
+	return nil
+}
+
+// downloadResponseHeaderTimeout bounds how long the CDN may take to send
+// response headers. A dead edge otherwise burns the whole retry budget on
+// 30-second waits before the read reaches its own budget (~2 minutes of
+// "driver_open" latency measured on a real mount).
+const downloadResponseHeaderTimeout = 10 * time.Second
+
+// newDownloadHTTPClient keeps no whole-request timeout: reads are bounded by
+// the read domain's idle/total fetch budgets so a large Range can stream.
+// The dialer skips CDN edges that recently failed.
+func (c *client) newDownloadHTTPClient() *http.Client {
+	transport := httputil.DefaultTransport(downloadResponseHeaderTimeout)
+	if c.edges != nil {
+		transport.DialContext = c.edges.dial(transport.DialContext)
+	}
+	return &http.Client{Transport: transport, CheckRedirect: checkDownloadRedirect}
 }
 
 func newOSSClient() *http.Client {
@@ -317,7 +363,7 @@ func (c *client) doRequest(ctx context.Context, method, baseURL, path string, qu
 				if cerr := ctx.Err(); cerr != nil {
 					return fmt.Errorf("request failed: %w", err)
 				}
-				time.Sleep(util.ExponentialBackoff(attempt))
+				retrySleep(attempt)
 				continue
 			}
 			return fmt.Errorf("request failed: %w", err)
@@ -361,9 +407,13 @@ func (c *client) doRequest(ctx context.Context, method, baseURL, path string, qu
 				c.updateCookie(cookie.Name, cookie.Value)
 			}
 		}
+		if resp.StatusCode == http.StatusUnauthorized && cookieSnapshot == "" && attempt < 2 && c.onAuthRetry != nil && c.onAuthRetry() {
+			c.recordMetric(ctx, event)
+			continue
+		}
 		if retryableHTTPStatus(resp.StatusCode) && attempt < httpMaxRetries {
 			c.recordMetric(ctx, event)
-			time.Sleep(util.ExponentialBackoff(attempt))
+			retrySleep(attempt)
 			continue
 		}
 		if result != nil {
@@ -385,6 +435,72 @@ func (c *client) doRequest(ctx context.Context, method, baseURL, path string, qu
 	return fmt.Errorf("max retries exceeded")
 }
 
+// downloadHTTP returns the current download client generation. A failure from
+// a previous body read is applied here, before the next request, so the retry
+// that follows the failure cannot race the connection swap.
+func (c *client) downloadHTTP() *http.Client {
+	c.downloadMu.RLock()
+	dirty := c.downloadDirty
+	current := c.downloadClient
+	c.downloadMu.RUnlock()
+	if !dirty {
+		return current
+	}
+	return c.rotateDownload()
+}
+
+// markDownloadFailed records that the current download connection produced a
+// failed body read. The next request swaps to a fresh connection pool.
+func (c *client) markDownloadFailed(reason string) {
+	c.downloadMu.Lock()
+	c.downloadDirty = true
+	c.downloadReason = reason
+	c.downloadMu.Unlock()
+}
+
+// downloadDebugSnapshot reports how many times the pool was replaced and the
+// most recent reason. It is read by the driver debug snapshot.
+func (c *client) downloadDebugSnapshot() (rotations int, lastReason string) {
+	c.downloadMu.RLock()
+	defer c.downloadMu.RUnlock()
+	return c.downloadRotations, c.downloadLastReason
+}
+
+// downloadRotateMinInterval bounds how often a failure may replace the
+// download transport: a seek cancels prefetch windows frequently and must not
+// discard a healthy connection pool each time, while a real stall retries on
+// the next read with a fresh connection.
+const downloadRotateMinInterval = 5 * time.Second
+
+// rotateDownload replaces the download client with a fresh connection pool and
+// closes the previous generation's idle connections. Requests already in
+// flight finish on the old pool; everything new avoids the degraded one.
+func (c *client) rotateDownload() *http.Client {
+	c.downloadMu.Lock()
+	if !c.downloadDirty || (!c.downloadRotated.IsZero() && time.Since(c.downloadRotated) < downloadRotateMinInterval) {
+		current := c.downloadClient
+		c.downloadMu.Unlock()
+		return current
+	}
+	old := c.downloadClient
+	reason := c.downloadReason
+	fresh := c.newDownloadHTTPClient()
+	c.downloadClient = fresh
+	c.downloadDirty = false
+	c.downloadReason = ""
+	c.downloadRotated = time.Now()
+	c.downloadRotations++
+	c.downloadLastReason = reason
+	c.downloadMu.Unlock()
+	if old != nil {
+		if transport, ok := old.Transport.(*http.Transport); ok {
+			transport.CloseIdleConnections()
+		}
+	}
+	logging.L.Debugf("[QUARK] rotate download transport reason=%q", reason)
+	return fresh
+}
+
 func (c *client) doDownload(req *http.Request, cookieSnapshot string) (*http.Response, error) {
 	if err := validateDownloadURL(req.URL); err != nil {
 		return nil, err
@@ -396,12 +512,21 @@ func (c *client) doDownload(req *http.Request, cookieSnapshot string) (*http.Res
 	req.Header.Set("User-Agent", defaultUserAgent)
 	req.Header.Set("Referer", defaultReferer+"/")
 	req.Header.Set("Accept", "*/*")
-	resp, err := c.downloadClient.Do(req)
+	resp, err := c.downloadHTTP().Do(req)
 	var requestErr *url.Error
 	if errors.As(err, &requestErr) {
 		// Signed download URLs carry credentials; keep the underlying network
 		// error for retry classification without including the URL in logs.
 		err = requestErr.Err
+	}
+	if err != nil {
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			// A header timeout means the edge is dead or overloaded; retrying
+			// the same connection only repeats the wait.
+			c.markDownloadFailed("download request timed out: " + err.Error())
+			c.rotateDownload()
+		}
 	}
 	return resp, err
 }

@@ -440,6 +440,115 @@ func TestDriverReadUsesEncryptedRange(t *testing.T) {
 	if raw.reads[1].size != BlockSize {
 		t.Fatalf("range raw size = %d, want %d", raw.reads[1].size, BlockSize)
 	}
+	budget := 1
+	source, err := drive.NewReadSource(drv, &drive.ReadOverride{MaxInFlight: &budget})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	bounded, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	content, err := source.Fetch(bounded, drive.Entry{ID: "file", Size: int64(len(plain))}, drive.RangePlan{Offset: offset, Size: size, Streams: 1})
+	if err != nil || !bytes.Equal(content, plain[offset:offset+size]) {
+		t.Fatalf("encrypted source budget one: bytes=%d error=%v", len(content), err)
+	}
+
+}
+
+func TestDriverReadPassesEncryptedSizeToRawDriver(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	cp, err := NewRcloneCipher("password", "salt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := make([]byte, BlockDataSize*3+123)
+	for i := range plain {
+		plain[i] = byte(i % 251)
+	}
+	var nonce [FileNonceSize]byte
+	copy(nonce[:], []byte("encrypted-size-test-01"))
+	encrypted, err := io.ReadAll(NewEncryptingReader(bytes.NewReader(plain), cp, nonce, int64(len(plain))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := &clampingRawDriver{recordingRawDriver: recordingRawDriver{data: encrypted}}
+	drv := NewDriver(raw, cp, DriverOptions{})
+
+	offset := int64(len(plain) - 123)
+	rc, err := drv.Read(ctx, drive.Entry{ID: "file", Size: int64(len(plain))}, offset, 123)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = rc.Close()
+	if !bytes.Equal(got, plain[offset:]) {
+		t.Fatal("partial final block returned wrong plaintext")
+	}
+	if want := cp.EncryptedSize(int64(len(plain))); raw.seenSize != want {
+		t.Fatalf("raw driver entry size = %d, want encrypted size %d", raw.seenSize, want)
+	}
+}
+
+// clampingRawDriver mimics providers such as Quark that clamp a read to the
+// entry size they were given. The crypt wrapper must hand it the encrypted
+// size, not the plaintext size, or the final block is truncated.
+type clampingRawDriver struct {
+	recordingRawDriver
+	seenSize int64
+}
+
+func (d *clampingRawDriver) Read(ctx context.Context, entry drive.Entry, offset, size int64) (io.ReadCloser, error) {
+	d.seenSize = entry.Size
+	if entry.Size > 0 {
+		if offset >= entry.Size {
+			return io.NopCloser(bytes.NewReader(nil)), nil
+		}
+		if size > entry.Size-offset {
+			size = entry.Size - offset
+		}
+	}
+	return d.recordingRawDriver.Read(ctx, entry, offset, size)
+}
+
+func TestDriverForwardsReadPolicyAndLimits(t *testing.T) {
+	cp, err := NewRcloneCipher("password", "salt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := drive.DefaultReadPolicy()
+	p.Bulk.Streams = 6
+	p.MaxInFlight = 8
+	p.Bulk.Split.PartBytes = 4 << 20
+	p.Interactive.Sequential.Prefetch = drive.PrefetchPolicy{Mode: drive.PrefetchFixed, WindowBytes: 8 << 20, Depth: 2}
+	raw := &profiledRawDriver{profile: p, capabilities: []drive.Capability{drive.CapabilityParallelRange}, maxParallel: 2}
+	d := NewDriver(raw, cp, DriverOptions{})
+	if d.ReadPolicy() != p {
+		t.Fatal("recommendation changed through encryption")
+	}
+	resolved, err := drive.ResolveReadPolicy(d, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Effective.MaxInFlight != 2 || resolved.Effective.Bulk.Streams != 2 || resolved.Effective.Interactive != p.Interactive {
+		t.Fatalf("policy=%+v", resolved)
+	}
+}
+
+type profiledRawDriver struct {
+	recordingRawDriver
+	profile      drive.ReadPolicy
+	capabilities []drive.Capability
+	maxParallel  int
+}
+
+func (d *profiledRawDriver) Capabilities() []drive.Capability { return d.capabilities }
+func (d *profiledRawDriver) ReadPolicy() drive.ReadPolicy     { return d.profile }
+func (d *profiledRawDriver) ReadLimits() drive.ReadLimits {
+	return drive.ReadLimits{MaxInFlight: d.maxParallel, Parallel: true}
 }
 
 func TestDriverForeignEntriesReportsUndecryptableNames(t *testing.T) {
